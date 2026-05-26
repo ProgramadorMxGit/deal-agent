@@ -1,0 +1,22 @@
+{
+  "letter": "L",
+  "product_title": "Samsung Galaxy A32 128GB Smartphone",
+  "marketplace": "walmart",
+  "source": "telegram",
+  "source_channel": "ofertonesmexico",
+  "original_text": "🚨 ERROR DE PRECIO 🚨\nSamsung Galaxy A32 128GB\nWalmart - $197\nA SOLO 197!!! CORRAN 🔥⚡",
+  "original_url": "https://www.walmart.com.mx/p/example-l",
+  "resolved_url": "https://www.walmart.com.mx/p/example-l",
+  "current_price": 197.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "samsung",
+  "category": "smartphone",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "A SOLO", "CORRAN"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "very high",
+  "score_expected_min": 90
+}

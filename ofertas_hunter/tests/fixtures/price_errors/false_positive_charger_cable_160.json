@@ -1,0 +1,26 @@
+{
+  "letter": "FP3",
+  "label": "false_positive_generic_charger_cable_160",
+  "product_title": "Cargador Rápida 20w + 2 Metros Cable Tipo C Para iPhone",
+  "marketplace": "mercadolibre",
+  "source": "mercadolibre_hunter",
+  "source_channel": null,
+  "original_text": null,
+  "original_url": "https://articulo.mercadolibre.com.mx/MLM-FP3-cargador-cable-2m",
+  "resolved_url": "https://articulo.mercadolibre.com.mx/MLM-FP3-cargador-cable-2m",
+  "current_price": 160.05,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "phone_accessory",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": [],
+  "expected_classification": "no_price_error_or_normal_offer",
+  "should_publish_as_price_error": false,
+  "expected_reasons_contains": [
+    "generic_accessory_not_price_error",
+    "compatible_with_premium_brand_not_premium_product"
+  ]
+}

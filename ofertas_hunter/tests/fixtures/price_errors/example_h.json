@@ -1,0 +1,22 @@
+{
+  "letter": "H",
+  "product_title": "Apple AirPods Pro 2da Generación con MagSafe",
+  "marketplace": "office_depot",
+  "source": "telegram",
+  "source_channel": "OFERTAS_PREMIUM_MX",
+  "original_text": "OTRO ERROR DE PRECIO\nApple AirPods Pro\nOffice Depot - $599.90\nDEJA PEDIR 🚨🔥⚡",
+  "original_url": "https://www.officedepot.com.mx/p/example-h",
+  "resolved_url": "https://www.officedepot.com.mx/p/example-h",
+  "current_price": 599.90,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "audio_premium",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["OTRO ERROR DE PRECIO", "DEJA PEDIR"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "high",
+  "score_expected_min": 80
+}

@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "ofertas-hunter": {
+      "command": "C:\\Users\\yarteaga\\Desktop\\bot_autonomo_ofert\\ofertas_hunter\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "ofertas_hunter",
+        "mcp-serve",
+        "--no-lock"
+      ],
+      "cwd": "C:\\Users\\yarteaga\\Desktop\\bot_autonomo_ofert\\ofertas_hunter",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "timeout": 60000,
+      "disabled": false,
+      "autoApprove": [
+        "get_status",
+        "get_schedule_mode",
+        "get_outbox",
+        "get_recent_events",
+        "get_frontier_stats",
+        "discover_seeds",
+        "hunt_amazon",
+        "hunt_mercadolibre",
+        "dispatch_outbox",
+        "revalidate_offer",
+        "pause_marketplace",
+        "unpause_marketplace",
+        "request_offer_review",
+        "submit_offer_review",
+        "improve_message_copy",
+        "submit_message_copy"
+      ]
+    }
+  }
+}

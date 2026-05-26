@@ -1,0 +1,22 @@
+{
+  "letter": "G",
+  "product_title": "Laptop gamer MSI Thin GF63 Intel Core i5 8GB RAM 1TB SSD RTX 2050",
+  "marketplace": "coppel",
+  "source": "telegram",
+  "source_channel": "ofertonesmexico",
+  "original_text": "🚨 ERROR DE PRECIO 🚨\nLaptop gamer MSI Thin GF63 Intel Core i5 8GB RAM 1TB SSD RTX 2050\nCoppel - $2,719\nCORRAN A SOLO 2719!!! 🔥⚡",
+  "original_url": "https://www.coppel.com/p/example-g",
+  "resolved_url": "https://www.coppel.com/p/example-g",
+  "current_price": 2719.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "msi",
+  "category": "laptop_gaming",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "CORRAN", "A SOLO"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "very high",
+  "score_expected_min": 90
+}

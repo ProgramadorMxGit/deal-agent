@@ -1,0 +1,22 @@
+{
+  "letter": "E",
+  "product_title": "Nueva Dell Pro 16 Laptop Intel Core Ultra 5",
+  "marketplace": "dell",
+  "source": "telegram",
+  "source_channel": "OFERTAS_RELAMPAGO",
+  "original_text": "ERROR DE PRECIO!!!\nNueva Dell Pro 16 Laptop Intel Core Ultra 5\nDell - $1,544.70\nCORRAN 🚨🔥⚡",
+  "original_url": "https://www.dell.com/mx/p/example",
+  "resolved_url": "https://www.dell.com/mx/p/example",
+  "current_price": 1544.70,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "dell",
+  "category": "laptop_business",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "CORRAN"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "high",
+  "score_expected_min": 85
+}

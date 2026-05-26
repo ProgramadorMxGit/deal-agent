@@ -1,0 +1,22 @@
+{
+  "letter": "I",
+  "product_title": "Apple iPhone 16 Pro Max 256GB Titanio Natural",
+  "marketplace": "liverpool",
+  "source": "telegram",
+  "source_channel": "OFERTAS_RELAMPAGO",
+  "original_text": "🚨 ERROR DE PRECIO 🚨\nApple iPhone 16 Pro Max 256GB\nLiverpool - $3,899\nCORRAN A SOLO 3899!!! 🔥⚡",
+  "original_url": "https://www.liverpool.com.mx/p/example-i",
+  "resolved_url": "https://www.liverpool.com.mx/p/example-i",
+  "current_price": 3899.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "smartphone_flagship",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "CORRAN", "A SOLO"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "very high",
+  "score_expected_min": 90
+}

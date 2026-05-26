@@ -1,0 +1,28 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B00QX5GWHQ",
+  "final_url": "https://www.amazon.com.mx/dp/B00QX5GWHQ",
+  "status": 200,
+  "duration_ms": 344,
+  "blocked": true,
+  "error": "captcha_detected",
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "high",
+    "strong_signals": [
+      "form_action_validate_captcha"
+    ],
+    "weak_signals": [
+      "validateCaptcha",
+      "captcha-instrumentation"
+    ],
+    "visible_signals": [
+      "text_continuar_comprando"
+    ],
+    "should_pause_marketplace": true,
+    "reasons": [
+      "form_action_validate_captcha",
+      "body_tiny_with_amazon_title"
+    ]
+  },
+  "captured_at": "2026-05-26T19:41:55.795Z"
+}

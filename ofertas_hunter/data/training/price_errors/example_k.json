@@ -1,0 +1,22 @@
+{
+  "letter": "K",
+  "product_title": "Samsung Galaxy S24 256GB Marble Gray",
+  "marketplace": "sears",
+  "source": "telegram",
+  "source_channel": "OFERTAS_RELAMPAGO",
+  "original_text": "🚨🔥 ERROR DE PRECIO 🚨🔥\nSamsung Galaxy S24 256GB\nSears - $1,399\nCORRAAAN A SOLO 1399!!! ⚡⚡",
+  "original_url": "https://www.sears.com.mx/p/example-k",
+  "resolved_url": "https://www.sears.com.mx/p/example-k",
+  "current_price": 1399.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "samsung",
+  "category": "smartphone_flagship",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "CORRAAAN", "A SOLO"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "very high",
+  "score_expected_min": 90
+}

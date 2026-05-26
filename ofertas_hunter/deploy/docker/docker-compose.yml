@@ -1,0 +1,59 @@
+version: "3.9"
+
+# docker-compose para ofertas_hunter en VPS.
+#
+# Uso:
+#   docker compose -f deploy/docker/docker-compose.yml up -d dispatcher
+#
+# IMPORTANTE: el dispatcher por defecto está en dry-run. Para activar envío
+# real, edita .env con PUBLISHING_ENABLED=true y PUBLISHING_DRY_RUN=false
+# y reinicia el servicio.
+
+x-base: &base
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+  image: ofertas-hunter:latest
+  env_file:
+    - ../../.env
+  volumes:
+    - ../../data:/app/data
+    - ../../secrets:/app/secrets
+    - ../../logs:/app/logs
+  restart: unless-stopped
+  networks:
+    - ofertas-net
+
+services:
+  dispatcher:
+    <<: *base
+    container_name: ofertas-hunter-dispatcher
+    command: ["dispatch"]
+
+  telegram-listener:
+    <<: *base
+    container_name: ofertas-hunter-telegram
+    command: ["telegram-listen"]
+    profiles: ["telegram"]
+
+  amazon-hunter-once:
+    <<: *base
+    container_name: ofertas-hunter-amazon-oneshot
+    command: ["amazon-hunt", "--once", "--limit", "10"]
+    profiles: ["oneshot"]
+
+  ml-hunter-once:
+    <<: *base
+    container_name: ofertas-hunter-ml-oneshot
+    command: ["ml-enrich-affiliates", "--limit", "10"]
+    profiles: ["oneshot"]
+
+  maintenance:
+    <<: *base
+    container_name: ofertas-hunter-maintenance
+    command: ["compress-memory"]
+    profiles: ["maintenance"]
+
+networks:
+  ofertas-net:
+    driver: bridge

@@ -1,0 +1,26 @@
+{
+  "letter": "FP2",
+  "label": "false_positive_generic_charger_93",
+  "product_title": "Cargador 20w Carga Rápida Cabeza Única Compatible Con Iphone16/15/14/13/12/11",
+  "marketplace": "mercadolibre",
+  "source": "mercadolibre_hunter",
+  "source_channel": null,
+  "original_text": null,
+  "original_url": "https://articulo.mercadolibre.com.mx/MLM-FP2-cargador-cabeza-unica",
+  "resolved_url": "https://articulo.mercadolibre.com.mx/MLM-FP2-cargador-cabeza-unica",
+  "current_price": 93.98,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "phone_accessory",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": [],
+  "expected_classification": "no_price_error_or_normal_offer",
+  "should_publish_as_price_error": false,
+  "expected_reasons_contains": [
+    "generic_accessory_not_price_error",
+    "compatible_with_premium_brand_not_premium_product"
+  ]
+}

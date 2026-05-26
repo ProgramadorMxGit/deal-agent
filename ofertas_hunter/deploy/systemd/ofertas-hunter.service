@@ -1,0 +1,32 @@
+[Unit]
+Description=ofertas_hunter — orchestrator (hunters + price_intelligence)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_ROOT__
+EnvironmentFile=__PROJECT_ROOT__/.env
+
+ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter run
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs __PROJECT_ROOT__/secrets
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofertas-hunter
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+{
+  "letter": "C",
+  "product_title": "Tablet Apple iPad 11 pulgadas 256GB chip A16 Wi-Fi 6",
+  "marketplace": "coppel",
+  "source": "telegram",
+  "source_channel": "OFERTAS_PREMIUM_MX",
+  "original_text": "POSIBLE ERROR DE PRECIO\nTablet Apple iPad 11 pulgadas 256GB chip A16 Wi-Fi 6\nCoppel - $2,611\n🔥🔥🔥 DEJA PEDIR",
+  "original_url": "https://www.coppel.com/p/example",
+  "resolved_url": "https://www.coppel.com/p/example",
+  "current_price": 2611.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "tablet",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["POSIBLE ERROR DE PRECIO", "DEJA PEDIR"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "high",
+  "score_expected_min": 80
+}

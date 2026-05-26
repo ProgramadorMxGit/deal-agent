@@ -1,0 +1,22 @@
+{
+  "letter": "B",
+  "product_title": "Combo Laptop Asus Vivobook 16 AMD Ryzen 7 16GB RAM 512GB SSD + backpack + mouse",
+  "marketplace": "sams_club",
+  "source": "telegram",
+  "source_channel": "ofertonesmexico",
+  "original_text": "🚨 OTRO ERROR DE PRECIO 🚨\nCombo Laptop Asus Vivobook 16 AMD Ryzen 7 16GB RAM 512GB SSD + backpack + mouse\nSam's Club - $305.88\nA SOLO 305!!! CORRAN ⚡⚡⚡",
+  "original_url": "https://www.samsclub.com.mx/example/xyz",
+  "resolved_url": "https://www.samsclub.com.mx/example/xyz",
+  "current_price": 305.88,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "asus",
+  "category": "laptop",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["OTRO ERROR DE PRECIO", "A SOLO", "CORRAN"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "very high",
+  "score_expected_min": 90
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "playwright_cookie",
+    "value": "real",
+    "domain": ".mercadolibre.com.mx",
+    "path": "/",
+    "expires": 1893456000,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "Lax"
+  }
+]

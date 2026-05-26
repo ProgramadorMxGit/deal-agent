@@ -1,0 +1,22 @@
+{
+  "letter": "A",
+  "product_title": "Laptop HP EliteBook 840 G6 Intel Core i7 32GB RAM 512GB SSD",
+  "marketplace": "walmart",
+  "source": "telegram",
+  "source_channel": "ofertonesmexico",
+  "original_text": "ERROR DE PRECIO???\nLaptop HP EliteBook 840 G6 Intel Core i7 32GB RAM 512GB SSD\nWalmart - $2,349\n🚨🔥 CORRAN!!!",
+  "original_url": "https://www.walmart.com.mx/example/abc",
+  "resolved_url": "https://www.walmart.com.mx/example/abc",
+  "current_price": 2349.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "hp",
+  "category": "laptop_business",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["ERROR DE PRECIO", "CORRAN"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "high",
+  "score_expected_min": 80
+}

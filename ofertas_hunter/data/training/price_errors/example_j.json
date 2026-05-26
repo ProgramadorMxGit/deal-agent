@@ -1,0 +1,23 @@
+{
+  "letter": "J",
+  "product_title": "Motherboard Gigabyte B450 AORUS M AM4 ATX",
+  "marketplace": "amazon",
+  "source": "amazon_hunter",
+  "source_channel": null,
+  "original_text": null,
+  "original_url": "https://www.amazon.com.mx/dp/B0EXAMPLEJ",
+  "resolved_url": "https://www.amazon.com.mx/dp/B0EXAMPLEJ",
+  "current_price": 611.62,
+  "previous_price": 1899.0,
+  "historical_median_price": 1850.0,
+  "discount_percent": null,
+  "brand": "gigabyte",
+  "category": "pc_components",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": [],
+  "classification_expected": "possible_price_error",
+  "confidence_expected": "medium",
+  "score_expected_min": 60
+}

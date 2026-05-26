@@ -1,0 +1,30 @@
+[Unit]
+Description=ofertas_hunter — Telegram listener (Telethon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_ROOT__
+EnvironmentFile=__PROJECT_ROOT__/.env
+
+ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter telegram-listen
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs __PROJECT_ROOT__/secrets
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofertas-hunter-telegram
+
+[Install]
+WantedBy=multi-user.target

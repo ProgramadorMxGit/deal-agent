@@ -1,0 +1,22 @@
+{
+  "letter": "F",
+  "product_title": "Audífonos Sony WF-1000XM5 Bluetooth Cancelación de Ruido",
+  "marketplace": "sony_store",
+  "source": "telegram",
+  "source_channel": "OFERTAS_PREMIUM_MX",
+  "original_text": "POSIBLE ERROR DE PRECIO\nAudífonos Sony WF-1000XM5\nSony Store - $899\nCORRAN 🚨🔥",
+  "original_url": "https://store.sony.com.mx/p/example",
+  "resolved_url": "https://store.sony.com.mx/p/example",
+  "current_price": 899.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "sony",
+  "category": "audio_premium",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["POSIBLE ERROR DE PRECIO", "CORRAN"],
+  "classification_expected": "price_error_confirmed",
+  "confidence_expected": "high",
+  "score_expected_min": 80
+}

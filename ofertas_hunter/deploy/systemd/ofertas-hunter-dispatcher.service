@@ -1,0 +1,30 @@
+[Unit]
+Description=ofertas_hunter — outbox dispatcher (WhatsApp via Evolution)
+After=network-online.target ofertas-hunter.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_ROOT__
+EnvironmentFile=__PROJECT_ROOT__/.env
+
+ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter dispatch
+
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofertas-hunter-dispatcher
+
+[Install]
+WantedBy=multi-user.target

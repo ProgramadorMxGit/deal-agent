@@ -1,0 +1,26 @@
+{
+  "letter": "FP1",
+  "label": "false_positive_generic_charger_76",
+  "product_title": "Cargador TIPO C GaN Turbo 20W Carga Rápida 3A 1HORA con Cable USB C a IP Compatible con iPhone",
+  "marketplace": "mercadolibre",
+  "source": "mercadolibre_hunter",
+  "source_channel": null,
+  "original_text": null,
+  "original_url": "https://articulo.mercadolibre.com.mx/MLM-FP1-cargador-20w",
+  "resolved_url": "https://articulo.mercadolibre.com.mx/MLM-FP1-cargador-20w",
+  "current_price": 76.62,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "phone_accessory",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": [],
+  "expected_classification": "no_price_error_or_normal_offer",
+  "should_publish_as_price_error": false,
+  "expected_reasons_contains": [
+    "generic_accessory_not_price_error",
+    "compatible_with_premium_brand_not_premium_product"
+  ]
+}

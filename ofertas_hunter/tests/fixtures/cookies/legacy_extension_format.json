@@ -1,0 +1,31 @@
+[
+  {
+    "name": "_d2id",
+    "value": "abc123",
+    "domain": ".mercadolibre.com.mx",
+    "path": "/",
+    "expirationDate": 1893456000,
+    "hostOnly": false,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "no_restriction",
+    "session": false,
+    "storeId": "0"
+  },
+  {
+    "name": "session_id",
+    "value": "xyz",
+    "domain": "mercadolibre.com.mx",
+    "path": "/",
+    "expirationDate": 1893456000,
+    "secure": true,
+    "sameSite": "lax"
+  },
+  {
+    "name": "broken",
+    "value": null
+  },
+  {
+    "name": "incomplete"
+  }
+]

@@ -1,0 +1,22 @@
+{
+  "letter": "D",
+  "product_title": "Camisa COOFANDY Hombre Casual",
+  "marketplace": "amazon",
+  "source": "telegram",
+  "source_channel": "OFERTAS_PREMIUM_MX",
+  "original_text": "Camisa COOFANDY Hombre\nAmazon\n91% DE DESCUENTO 🔥\nAntes $599.85\nAHORA $56.85",
+  "original_url": "https://amzn.to/abc123",
+  "resolved_url": "https://www.amazon.com.mx/dp/B0EXAMPLE",
+  "current_price": 56.85,
+  "previous_price": 599.85,
+  "discount_percent": 91.0,
+  "brand": null,
+  "category": "apparel",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": [],
+  "classification_expected": "possible_price_error",
+  "confidence_expected": "medium",
+  "score_expected_min": 60
+}

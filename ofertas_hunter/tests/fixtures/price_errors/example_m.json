@@ -1,0 +1,22 @@
+{
+  "letter": "M",
+  "product_title": "iPad Mini Apple WiFi 64GB",
+  "marketplace": "sams_club",
+  "source": "telegram",
+  "source_channel": "OFERTAS_PREMIUM_MX",
+  "original_text": "POSIBLE ERROR DE PRECIO\niPad Mini Apple WiFi 64GB\nSam's Club - $4,999\n🔥",
+  "original_url": "https://www.samsclub.com.mx/p/example-m",
+  "resolved_url": "https://www.samsclub.com.mx/p/example-m",
+  "current_price": 4999.0,
+  "previous_price": null,
+  "discount_percent": null,
+  "brand": "apple",
+  "category": "tablet",
+  "condition": "new",
+  "has_stock": true,
+  "has_image": true,
+  "urgency_terms": ["POSIBLE ERROR DE PRECIO"],
+  "classification_expected": "possible_price_error",
+  "confidence_expected": "medium",
+  "score_expected_min": 60
+}
