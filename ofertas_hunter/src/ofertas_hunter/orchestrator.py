@@ -204,6 +204,7 @@ class AgentFactoryBuilder:
         retorna `skipped=True` (ver `WhatsAppPublisher`).
         """
         from .dispatching.cooldown import CooldownPolicy
+        from .dispatching.curator_factory import build_diversity_curator
         from .dispatching.dispatcher import (
             OutboxDispatcher,
             make_sqlite_published_recorder,
@@ -235,10 +236,17 @@ class AgentFactoryBuilder:
                     cooldown=CooldownPolicy(cooldown_seconds=s.whatsapp_cooldown_seconds),
                 ),
             )
+            # Diversity curator: si la feature está habilitada en settings,
+            # lo inyectamos como `item_selector`. Cuando es None el dispatcher
+            # mantiene el path legacy (`pick_random_eligible`).
+            curator = build_diversity_curator(self.db, s)
+            item_selector = curator.pick if curator is not None else None
+
             dispatcher = OutboxDispatcher(
                 outbox=outbox,
                 publisher=publisher,
                 published_recorder=make_sqlite_published_recorder(self.db),
+                item_selector=item_selector,
                 idle_sleep_seconds=cfg.dispatcher_loop_interval,
                 scheduler=self.scheduler,
             )

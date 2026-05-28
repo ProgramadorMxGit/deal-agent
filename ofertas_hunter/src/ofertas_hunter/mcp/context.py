@@ -258,15 +258,23 @@ class ServerContext:
     def get_dispatcher(self):
         if self._dispatcher is not None:
             return self._dispatcher
+        from ..dispatching.curator_factory import build_diversity_curator
         from ..dispatching.dispatcher import (
             OutboxDispatcher,
             make_sqlite_published_recorder,
         )
 
+        # Diversity curator: si la feature está habilitada en settings, se
+        # inyecta como `item_selector`; cuando es None el dispatcher mantiene
+        # el path legacy (`pick_random_eligible`). Zero-regression por default.
+        curator = build_diversity_curator(self.db, self.settings)
+        item_selector = curator.pick if curator is not None else None
+
         dispatcher = OutboxDispatcher(
             outbox=self.get_outbox_repo(),
             publisher=self.get_publisher(),
             published_recorder=make_sqlite_published_recorder(self.db),
+            item_selector=item_selector,
             idle_sleep_seconds=60,
             scheduler=self.scheduler,
             revalidator=None,
