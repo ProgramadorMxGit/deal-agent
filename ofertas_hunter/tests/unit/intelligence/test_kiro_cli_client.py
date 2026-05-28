@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -126,3 +127,63 @@ async def test_ask_json_returns_none_when_binary_not_found():
     ):
         result = await client.ask_json("test")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_ask_json_propagates_cancellation():
+    """Si el caller cancela la tarea, el subprocess debe morir y la
+    cancelación debe propagarse (no swallow-earse).
+
+    Importante: NO mockeamos ``asyncio.wait_for`` — dejamos que el real
+    vea el ``CancelledError`` lanzado desde ``communicate``. Así
+    ejercitamos el flujo completo del except clause.
+    """
+    client = KiroCliClient(
+        KiroCliConfig(binary_path="/fake/kiro-cli", timeout_seconds=5.0)
+    )
+
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.CancelledError())
+    fake_proc.kill = MagicMock()
+    fake_proc.wait = AsyncMock()
+
+    with patch("asyncio.create_subprocess_exec", return_value=fake_proc):
+        with pytest.raises(asyncio.CancelledError):
+            await client.ask_json("test")
+
+    # Subprocess debe haber sido terminado: kill llamado y wait awaited.
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_json_kill_failure_logged_not_swallowed_silently(caplog):
+    """Si ``proc.kill()`` falla durante el cleanup de timeout, el error
+    debe loguearse (no ``except Exception: pass``), pero el flujo debe
+    continuar y devolver ``None`` sin re-lanzar.
+    """
+    client = KiroCliClient(
+        KiroCliConfig(binary_path="/fake/kiro-cli", timeout_seconds=0.1)
+    )
+
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    fake_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+    fake_proc.kill = MagicMock(side_effect=OSError("kill failed"))
+    fake_proc.wait = AsyncMock()
+
+    with caplog.at_level(logging.WARNING, logger="ofertas_hunter.intelligence.kiro_cli_client"):
+        with patch("asyncio.create_subprocess_exec", return_value=fake_proc), \
+             patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
+            result = await client.ask_json("test")
+
+    # Flujo gracioso: ``None`` y sin excepción.
+    assert result is None
+    fake_proc.kill.assert_called_once()
+    # Algo se logueó (al menos el timeout warning, idealmente también el
+    # error de kill via ``logger.exception``).
+    assert caplog.records, "se esperaban logs warnings/errors durante el cleanup"
+    # Verificar que el error de kill quedó registrado (no silencioso).
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "kill" in messages.lower() or "matando" in messages.lower()

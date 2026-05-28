@@ -27,11 +27,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# Clave esperada en el JSON de respuesta del curator. Si el contrato del
+# schema cambia (schema drift), actualizar esta constante para que el
+# regex de extracción siga encontrando el bloque correcto.
+EXPECTED_JSON_KEY = "chosen_id"
+
 # Regex para extraer un objeto JSON del stdout (tolerante a markdown,
 # texto introductorio, etc.). Busca el bloque más cercano que contiene
-# la clave ``chosen_id`` (no soporta objetos anidados — suficiente para
+# la clave esperada (no soporta objetos anidados — suficiente para
 # el contrato actual del curator).
-_JSON_BLOCK_RE = re.compile(r"\{[^{}]*\"chosen_id\"[^{}]*\}", re.DOTALL)
+_JSON_BLOCK_RE = re.compile(
+    r"\{[^{}]*\"" + re.escape(EXPECTED_JSON_KEY) + r"\"[^{}]*\}",
+    re.DOTALL,
+)
 
 
 def resolve_kiro_cli_path() -> str:
@@ -101,6 +109,28 @@ class KiroCliClient:
     def __init__(self, config: Optional[KiroCliConfig] = None) -> None:
         self.config = config or KiroCliConfig()
 
+    @staticmethod
+    async def _terminate(proc: "asyncio.subprocess.Process") -> None:
+        """Mata el subprocess y espera su exit.
+
+        - Tolera ``ProcessLookupError`` (el proceso ya terminó) silenciosamente.
+        - Cualquier otro error se loguea con stack trace pero no se propaga
+          para no romper el flujo de timeout/cancelación.
+        """
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            logger.exception("kiro-cli: error matando subprocess")
+
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            logger.exception("kiro-cli: error esperando subprocess tras kill")
+
     async def ask_json(
         self,
         prompt: str,
@@ -142,16 +172,22 @@ class KiroCliClient:
                 timeout=self.config.timeout_seconds,
             )
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+            await self._terminate(proc)
             logger.warning(
                 "kiro-cli: timeout (%.1fs) — matando subprocess",
                 self.config.timeout_seconds,
             )
             return None
+        except asyncio.CancelledError:
+            # Crucial: si el caller cancela (shutdown, watchdog, wait_for
+            # exterior), debemos matar el subprocess para no dejar procesos
+            # huérfanos con --trust-all-tools, y luego re-lanzar la
+            # cancelación para no swallow-ear la señal.
+            await self._terminate(proc)
+            logger.warning(
+                "kiro-cli: tarea cancelada — matando subprocess"
+            )
+            raise
         except Exception:
             logger.exception("kiro-cli: error en communicate")
             return None
