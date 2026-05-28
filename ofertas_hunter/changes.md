@@ -4,6 +4,97 @@ Log de decisiones por bloque, alineado con la spec del usuario.
 
 ---
 
+## 2026-05-28 — Diversity Curator Agent (selección IA del outbox)
+
+### Goal
+Reemplazar la elección aleatoria del `OutboxDispatcher` (`pick_random_eligible`) por un agente IA que decide qué oferta publicar al grupo de WhatsApp para maximizar diversidad por categoría, marca, marketplace y rango de precio. Usa `kiro-cli` como LLM con fallback determinístico cuando el LLM falla.
+
+### Garantía clave
+Si `DIVERSITY_CURATOR_ENABLED=false` (default) → comportamiento idéntico al actual (`pick_random_eligible`). Si el binario `kiro-cli` no está disponible → degrada a curator sin LLM (top1 del scorer determinístico). Cero regresiones en producción.
+
+### Arquitectura
+1. `DiversityScorer` — scoring determinístico de candidatos según historial.
+2. `KiroCliClient` — wrapper async sobre `subprocess kiro-cli --classic --no-interactive`, con timeout, regex extractor de JSON, manejo de cancelación que no deja procesos huérfanos.
+3. `DiversityCurator` — orquesta: filtra elegibles → scorea → top 10 → consulta LLM → fallback al top 1 si falla.
+4. `OutboxDispatcher` acepta `item_selector` opcional. Cuando es `None` mantiene el comportamiento legacy.
+5. `build_diversity_curator(db, settings)` factory compartida entre `ServerContext` (modos MCP [1]/[2]) y `Orchestrator` (modo [3]).
+
+### Componentes nuevos
+
+`src/ofertas_hunter/dispatching/diversity_scorer.py`:
+- `DiversityScorer(history_size=10, top_n=10)` con `rank(candidates, history) -> list[ScoredCandidate]`.
+- `HistoryEntry(marketplace, category, brand, price_bucket, sent_at)` — convención `history[0]` = más reciente.
+- `price_bucket(price)` clasifica low (<500) / mid (500-2999) / high (≥3000) MXN.
+- Multiplicadores módulo-nivel: `CATEGORY_REPEAT_BASE=0.5`, `BRAND_REPEAT_BASE=0.7`, `LAST_MARKETPLACE_PENALTY=0.7`, `LAST_PRICE_BUCKET_PENALTY=0.85`, `CATEGORY_ABSENT_BONUS=1.5`.
+- 12 tests unitarios.
+
+`src/ofertas_hunter/intelligence/kiro_cli_client.py`:
+- `KiroCliConfig(binary_path="", classic_mode=True, timeout_seconds=30.0)`.
+- `KiroCliClient.ask_json(prompt, agent=None) -> Optional[dict]` — nunca lanza, retorna `None` ante cualquier fallo.
+- `resolve_kiro_cli_path()` con orden: env `KIRO_CLI` > `~/.local/bin/kiro-cli` (Linux) / `%LOCALAPPDATA%\Kiro-Cli\kiro-cli.exe` (Windows) > `shutil.which()` > fallback `"kiro-cli"`.
+- `_terminate(proc)` helper que mata el subprocess y espera; tolera `ProcessLookupError`, loguea cualquier otro error con `logger.exception`.
+- Maneja `asyncio.CancelledError`: mata el subprocess, loguea, **re-lanza** la cancelación (evita procesos huérfanos en shutdown).
+- Constante `EXPECTED_JSON_KEY = "chosen_id"` con regex construido vía `re.escape` para evitar drift de schema silencioso.
+- 10 tests unitarios.
+
+`src/ofertas_hunter/dispatching/diversity_curator.py`:
+- `DiversityCurator(*, db, scorer, llm_client=None, history_size=10, candidate_limit=10)`.
+- `async def pick(outbox, last_normal_publication_at, now) -> Optional[OutboxItem]` cumple la firma de `ItemSelector`.
+- Algoritmo: `eligible_now()` → atajo si 1 candidato → `_load_history()` JOIN de `published_messages` + `outbox` → `scorer.rank()` top N → `llm_client.ask_json(_build_prompt(...))` → si LLM válido y `chosen_id ∈ topN` retorna ese item, si no fallback al top 1.
+- Auditoría: emite `runtime_event(kind="diversity_curator_decision")` con `{chosen_id, fallback_used, reason, candidates_count, history_size, llm_latency_ms}`. Auditoría falla → loguea, nunca interrumpe el dispatching.
+- `_load_history` skipea filas con JSON o `sent_at` corruptos y loguea WARNING (la versión inicial defaulteaba a `now()` y sesgaba el scorer).
+- 10 tests unitarios cubriendo criterios A-G del spec + persistencia.
+
+`src/ofertas_hunter/dispatching/curator_factory.py`:
+- `build_diversity_curator(db, settings) -> Optional[DiversityCurator]`.
+- Devuelve `None` si `diversity_curator_enabled=False` (path legacy).
+- Si `diversity_curator_use_llm=False` o falla import de `KiroCliClient` → curator sin LLM.
+
+### Componentes modificados
+
+`src/ofertas_hunter/dispatching/dispatcher.py`:
+- Type alias `ItemSelector = Callable[[InMemoryOutbox, Optional[datetime], datetime], Awaitable[Optional[OutboxItem]]]`.
+- `OutboxDispatcher.__init__` acepta `item_selector: Optional[ItemSelector] = None` (kw-only).
+- `tick()` usa el selector si está presente, con `try/except` que hace fallback a `pick_random_eligible` si lanza (zero-regression bajo cualquier fallo del curator/LLM/db).
+- 3 tests cubriendo: selector activo / ausente (legacy) / lanzando (fallback).
+
+`src/ofertas_hunter/config.py` (Settings):
+- 6 settings nuevos: `diversity_curator_enabled=False`, `diversity_curator_use_llm=True`, `diversity_curator_history_size=10`, `diversity_curator_candidate_limit=10`, `diversity_curator_llm_timeout_seconds=30.0`, `diversity_curator_kiro_cli_path=None`.
+
+`src/ofertas_hunter/mcp/context.py` (modos [1]/[2]):
+- `get_dispatcher()` invoca `build_diversity_curator(db, settings)` y pasa `curator.pick` como `item_selector` (o `None` si la feature está deshabilitada).
+
+`src/ofertas_hunter/orchestrator.py` (modo [3]):
+- `_build_dispatcher_factory()` hace lo mismo dentro del closure `factory`.
+
+### Verificación
+- 711 tests unitarios pasan (1 skipped Windows-only). Zero regresiones.
+- Suite completa: `tests/unit/dispatching/`, `tests/unit/intelligence/`, `tests/unit/mcp/`, `tests/unit/test_orchestrator.py` todos verdes.
+
+### Spec y plan
+- Spec: `docs/superpowers/specs/2026-05-28-diversity-curator-agent-design.md`.
+- Plan: `docs/superpowers/plans/2026-05-28-diversity-curator-agent.md` (8 tasks TDD).
+- Workflow: subagent-driven-development con implementer → spec-reviewer → quality-reviewer por task.
+
+### Activación en producción
+1. Editar `.env` en VPS: `DIVERSITY_CURATOR_ENABLED=true`, `DIVERSITY_CURATOR_USE_LLM=true` (o `false` para sólo determinístico).
+2. Asegurar que `kiro-cli` está instalado en el path (o setear `DIVERSITY_CURATOR_KIRO_CLI_PATH`).
+3. Reiniciar el servicio. Las decisiones quedan en `runtime_events(kind='diversity_curator_decision')` para auditoría.
+4. Para revertir: `DIVERSITY_CURATOR_ENABLED=false` + reinicio → comportamiento legacy.
+
+### Commits
+- `935cdf6` feat(dispatching): add DiversityScorer for outbox candidate ranking
+- `19ee52a` refactor(dispatching): address code review feedback for DiversityScorer
+- `add363f` feat(intelligence): add KiroCliClient async wrapper for kiro-cli
+- `f91a73c` fix(intelligence): handle CancelledError + improve error logging in KiroCliClient
+- `8922484` feat(dispatching): add DiversityCurator orchestrating scorer + LLM + fallback
+- `d1e2a2b` fix(dispatching): log and skip corrupt history rows in DiversityCurator
+- `cadd006` feat(dispatching): add optional item_selector to OutboxDispatcher
+- `e1fb2ee` feat(config): add diversity_curator settings and factory
+- `011f36b` feat(integration): wire DiversityCurator into ServerContext and Orchestrator
+
+---
+
 ## 2026-05-25 — Fase 1 completa + Fase 2 mínima
 
 ### Auditorías
