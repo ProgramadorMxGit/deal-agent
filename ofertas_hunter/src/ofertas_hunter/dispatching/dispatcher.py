@@ -37,7 +37,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Protocol
 
 from ..models import OutboxItem, OutboxState, OutboxType
@@ -95,6 +95,30 @@ class NullRevalidator:
 
 
 PublishedRecorder = Callable[[OutboxItem, PublishOutcome, datetime], Awaitable[None]]
+DuplicateChecker = Callable[[OutboxItem], bool]
+"""Callback síncrono: True si el item ya fue publicado recientemente.
+
+Usado para evitar publicar el mismo producto (mismo `item_id`/`asin`)
+múltiples veces cuando el outbox se llenó de duplicados antes del
+despacho. El dispatcher lo invoca justo antes de `publisher.publish`.
+"""
+
+
+ItemSelector = Callable[
+    [InMemoryOutbox, Optional[datetime], datetime],
+    Awaitable[Optional[OutboxItem]],
+]
+"""Callback async para elegir el siguiente item del outbox.
+
+Cuando se inyecta, reemplaza a `outbox.pick_random_eligible` en
+`OutboxDispatcher.tick`. La firma coincide con `DiversityCurator.pick`
+(diversity-curator-agent §5.4): recibe `(outbox, last_normal_pub_at, now)`
+y devuelve el `OutboxItem` elegido o `None` si no hay nada elegible.
+
+Si el selector lanza una excepción, el dispatcher hace fallback a
+`pick_random_eligible` para no detener publicaciones por un fallo del
+curator/LLM/db.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +136,8 @@ class OutboxDispatcher:
         *,
         revalidator: Optional[Revalidator] = None,
         published_recorder: Optional[PublishedRecorder] = None,
+        duplicate_checker: Optional[DuplicateChecker] = None,
+        item_selector: Optional[ItemSelector] = None,
         idle_sleep_seconds: float = 5.0,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         scheduler: Optional[OperatingScheduler] = None,
@@ -120,6 +146,8 @@ class OutboxDispatcher:
         self.publisher = publisher
         self.revalidator = revalidator or NullRevalidator()
         self._record_published = published_recorder
+        self._is_duplicate = duplicate_checker
+        self._item_selector = item_selector
         self.idle_sleep_seconds = idle_sleep_seconds
         self._clock = clock
         self.scheduler = scheduler
@@ -166,10 +194,24 @@ class OutboxDispatcher:
 
             await self._revalidate_old_items(now)
 
-            picked = self.outbox.pick_random_eligible(
-                last_normal_publication_at=self._last_normal_publication_at,
-                now=now,
-            )
+            if self._item_selector is not None:
+                try:
+                    picked = await self._item_selector(
+                        self.outbox, self._last_normal_publication_at, now
+                    )
+                except Exception:
+                    logger.exception(
+                        "item_selector raised — falling back to pick_random_eligible"
+                    )
+                    picked = self.outbox.pick_random_eligible(
+                        last_normal_publication_at=self._last_normal_publication_at,
+                        now=now,
+                    )
+            else:
+                picked = self.outbox.pick_random_eligible(
+                    last_normal_publication_at=self._last_normal_publication_at,
+                    now=now,
+                )
             if picked is None:
                 return None
 
@@ -230,6 +272,29 @@ class OutboxDispatcher:
     # ------------------------------------------------------------------
 
     async def _publish_item(self, item: OutboxItem, now: datetime) -> PublishOutcome:
+        # Anti-duplicado: si ya publicamos recientemente el mismo
+        # item_id/asin, descartamos antes de quemar API quota.
+        if self._is_duplicate is not None:
+            try:
+                already = bool(self._is_duplicate(item))
+            except Exception:
+                logger.exception("duplicate_checker raised on item=%s", item.id)
+                already = False
+            if already:
+                logger.info(
+                    "Publish skipped (recent_duplicate) item=%s — descartando",
+                    item.id,
+                )
+                self.outbox.mark_discarded(item, reason="recent_duplicate_dispatched")
+                return PublishOutcome(
+                    success=False,
+                    dry_run=False,
+                    formatted=None,
+                    evolution_response=None,
+                    skipped=True,
+                    skip_reason="recent_duplicate",
+                )
+
         outcome = await self.publisher.publish(item)
 
         if outcome.skipped:
@@ -351,3 +416,86 @@ def make_sqlite_published_recorder(conn) -> PublishedRecorder:
         )
 
     return _record
+
+
+def make_sqlite_duplicate_checker(
+    conn, *, hours: int = 48
+) -> DuplicateChecker:
+    """Factory de ``DuplicateChecker`` que consulta SQLite.
+
+    Considera duplicado un item cuyo ``item_id`` o ``asin`` (extraído del
+    payload del outbox) ya aparece en ``published_messages`` con
+    ``success=1`` dentro de las últimas ``hours`` horas.
+
+    Esto cierra el guard que existe a nivel de hunter (al encolar) con
+    uno a nivel de dispatcher (al despachar): si el outbox ya estaba
+    lleno de duplicados antes de aplicar este check, no llegan a
+    WhatsApp.
+    """
+
+    def _check(item: OutboxItem) -> bool:
+        payload = item.message_payload or {}
+        item_id = payload.get("item_id") or payload.get("asin")
+        if not item_id:
+            return False
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        try:
+            row = conn.execute(
+                """
+                SELECT pm.id FROM published_messages pm
+                JOIN outbox o ON pm.outbox_id = o.id
+                WHERE pm.success = 1
+                  AND pm.sent_at >= ?
+                  AND pm.outbox_id != ?
+                  AND (
+                    json_extract(o.message_payload_json, '$.item_id') = ?
+                    OR json_extract(o.message_payload_json, '$.asin') = ?
+                  )
+                LIMIT 1
+                """,
+                (cutoff, item.id, item_id, item_id),
+            ).fetchone()
+        except Exception:
+            logger.exception("duplicate_checker SQL falló")
+            return False
+        return row is not None
+
+    return _check
+
+    return _check
+
+
+def make_stale_price_checker(*, max_age_hours: int = 4) -> DuplicateChecker:
+    """Descarta items cuyo ``previous_price`` puede estar obsoleto.
+
+    Un item con ``previous_price`` que lleva más de ``max_age_hours``
+    horas en el outbox sin publicarse probablemente tiene un precio
+    anterior que ya no existe en la página (Amazon lo quitó, Hot Sale
+    terminó, etc.). Lo descartamos para no publicar descuentos falsos.
+
+    Aplica sólo a items ``type=normal`` con ``previous_price`` presente.
+    Items sin ``previous_price`` ya son rechazados por el formatter.
+    """
+
+    def _check(item: OutboxItem) -> bool:
+        if item.type != "normal":
+            return False
+        payload = item.message_payload or {}
+        if payload.get("previous_price") is None:
+            return False
+        # Si el item lleva más de max_age_hours desde que se encoló,
+        # el precio anterior puede estar obsoleto.
+        age = datetime.now(timezone.utc) - item.enqueued_at
+        if age.total_seconds() > max_age_hours * 3600:
+            logger.info(
+                "stale_price_checker: item=%s age=%.1fh > %dh — descartando",
+                item.id,
+                age.total_seconds() / 3600,
+                max_age_hours,
+            )
+            return True
+        return False
+
+    return _check
