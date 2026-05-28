@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     amazon_user_data_dir: Optional[str] = "secrets/browser_profiles/amazon"
     amazon_warmup_homepage: bool = False
 
+    # Switch entre el hunter Amazon nuevo (`AmazonHunterAgent`) y el
+    # adapter del scraper legacy `AmazonScrapperIA`
+    # (`LegacyAmazonHunterAgent`). El legacy es más robusto contra
+    # captchas (browser efímero + UA random + stealth + delays gaussianos).
+    # El scoring final lo sigue haciendo `PriceErrorScorer` (bot nuevo).
+    # Ver `docs/AMAZON_LEGACY_INTEGRATION.md`.
+    amazon_hunter_legacy: bool = False
+
     # Mercado Libre
     mercadolibre_enabled: bool = True
     mercadolibre_headless: bool = True
@@ -72,6 +80,34 @@ class Settings(BaseSettings):
     mercadolibre_user_data_dir: Optional[str] = "secrets/browser_profiles/mercadolibre"
     bot_diversidad_global_cookies_path: Optional[str] = None
     ofertas_meli_browser_cookies_path: Optional[str] = None
+
+    # ML session recovery: avisos al admin + webhook entrante para hot-reload
+    # de cookies cuando ML detecta sesión expirada.
+    # Ver `docs/ML_SESSION_RECOVERY.md`.
+    ml_session_alert_enabled: bool = True
+    # Lista CSV de números admin (sin '+'), por ejemplo
+    # "528338498692,528112345678".
+    ml_session_admin_numbers: str = ""
+    # Cooldown entre avisos consecutivos al admin (default 30 min).
+    ml_session_alert_cooldown_seconds: int = 1800
+    # Servidor webhook entrante (Evolution API hace POST aquí cuando el
+    # admin manda el JSON de cookies via WhatsApp).
+    ml_session_inbound_enabled: bool = True
+    ml_session_inbound_host: str = "127.0.0.1"
+    ml_session_inbound_port: int = 9099
+    # Token compartido para autenticar el webhook (Evolution lo manda
+    # como header `X-Webhook-Secret`). Generado al deploy.
+    ml_session_inbound_secret: Optional[str] = None
+    # Cuántas versiones de cookies anteriores se preservan en disco.
+    ml_session_cookie_backup_count: int = 5
+
+    # ML session poller: pull periódico contra Evolution API para detectar
+    # `/cookies_ml` cuando Evolution NO puede alcanzar el webhook local
+    # (típico en deploys donde Evolution corre en otro servidor). Coexiste
+    # con el webhook sin conflicto.
+    ml_session_poller_enabled: bool = True
+    ml_session_poller_interval_seconds: int = 15
+    ml_session_poller_page_size: int = 20
 
     # Scheduler nocturno (hibernación + warmup)
     schedule_enabled: bool = True
@@ -122,6 +158,22 @@ class Settings(BaseSettings):
     llm_backend: str = "none"  # kiro_cli | anthropic | none
     anthropic_api_key: Optional[str] = None
     kiro_cli_path: Optional[str] = None
+
+    # Diversity Curator (selección IA del próximo item del outbox).
+    # Cuando `diversity_curator_enabled=False` el dispatcher mantiene el
+    # comportamiento legacy (`pick_random_eligible`). Cuando `True`, el
+    # curator se inyecta como `item_selector` en el OutboxDispatcher.
+    # Si `diversity_curator_use_llm=False`, el curator funciona en modo
+    # determinístico (top1 del scorer) — no requiere kiro-cli.
+    diversity_curator_enabled: bool = False
+    diversity_curator_use_llm: bool = True
+    diversity_curator_history_size: int = 10
+    diversity_curator_candidate_limit: int = 10
+    diversity_curator_llm_timeout_seconds: float = 30.0
+    # Override explícito al binario kiro-cli del curator (separado del
+    # `kiro_cli_path` global del LLM healer, por si el operador quiere
+    # un binario distinto). Si está vacío usa la auto-detección estándar.
+    diversity_curator_kiro_cli_path: Optional[str] = None
 
     # Scoring thresholds
     price_error_threshold_confirmed: int = 80
