@@ -8,10 +8,15 @@ D. LLM timeout → fallback a top1.
 E. LLM no instalado → arranca y degrada a top1.
 F. Sin candidatos → retorna None.
 G. Un solo candidato → skip LLM, retorna directo.
+
+Adicional (resiliencia de _load_history):
+- Filas con `message_payload_json` no parseable → logged WARNING y skip.
+- Filas con `sent_at` no parseable → logged WARNING y skip (no usar now()).
 """
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
@@ -248,3 +253,132 @@ async def test_curator_emits_event_on_success(db):
     assert p["chosen_id"] == 2
     assert p["fallback_used"] is False
     assert p["reason"] == "diverso"
+
+
+# ---------------------------------------------------------------------------
+# Resiliencia de _load_history — corrupción silenciada vs WARNING + skip
+# ---------------------------------------------------------------------------
+
+
+def _insert_outbox_row(
+    db: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    payload_json: str,
+) -> None:
+    """Inserta una fila mínima en `outbox`. `offer_id` se deja a 1 (no se valida FK
+    porque foreign_keys=ON requiere que `offers` exista; el test usa un esquema
+    fresco sin offers, por lo que la FK declarada queda inerte para este insert).
+    """
+    db.execute(
+        """
+        INSERT INTO outbox (
+            id, offer_id, type, enqueued_at, state, attempts, message_payload_json
+        ) VALUES (?, ?, 'normal', '2026-05-28T09:00:00.000Z', 'pending', 0, ?)
+        """,
+        (outbox_id, outbox_id, payload_json),
+    )
+
+
+def _insert_published_row(
+    db: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    sent_at: str,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO published_messages (
+            outbox_id, sent_at, success, message_text
+        ) VALUES (?, ?, 1, 'msg')
+        """,
+        (outbox_id, sent_at),
+    )
+
+
+@pytest.mark.asyncio
+async def test_curator_skips_history_row_with_bad_json(db, caplog):
+    """Si `message_payload_json` no es JSON válido, la fila se descarta y se loguea WARNING."""
+    # Fila corrupta
+    _insert_outbox_row(db, outbox_id=100, payload_json="{not json")
+    _insert_published_row(db, outbox_id=100, sent_at="2026-05-28T10:00:00.000Z")
+    # Fila válida (para confirmar que el resto del historial se carga)
+    _insert_outbox_row(
+        db,
+        outbox_id=101,
+        payload_json='{"category": "ok", "marketplace": "amazon", "current_price": 1500.0}',
+    )
+    _insert_published_row(db, outbox_id=101, sent_at="2026-05-28T11:00:00.000Z")
+
+    curator = DiversityCurator(db=db, scorer=DiversityScorer(), llm_client=None)
+    items = [_item(id=1, category="electronica"), _item(id=2, category="hogar")]
+    outbox = _make_outbox_with(items)
+
+    with caplog.at_level(
+        logging.WARNING, logger="ofertas_hunter.dispatching.diversity_curator"
+    ):
+        picked = await curator.pick(outbox, last_normal_publication_at=None, now=_now())
+
+    assert picked is not None  # pick no debe romperse por la fila corrupta
+
+    warnings = [
+        rec for rec in caplog.records
+        if rec.name == "ofertas_hunter.dispatching.diversity_curator"
+        and rec.levelno == logging.WARNING
+    ]
+    assert any(
+        "unparseable history row" in rec.getMessage()
+        or "history row" in rec.getMessage().lower()
+        for rec in warnings
+    ), f"Expected WARNING about unparseable history row, got: {[r.getMessage() for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_curator_skips_history_row_with_bad_sent_at(db, caplog):
+    """Si `sent_at` no es parseable, la fila se descarta (no defaultea a now())
+    y se loguea WARNING. Asserción clave: el scorer NO recibe esa fila como
+    `history[0]`, por lo que el item con la misma categoría conserva score=1.0.
+    """
+    # ÚNICA fila publicada en el historial: sent_at corrupto, payload válido
+    _insert_outbox_row(
+        db,
+        outbox_id=200,
+        payload_json='{"category": "x", "marketplace": "amazon", "current_price": 1000.0}',
+    )
+    _insert_published_row(db, outbox_id=200, sent_at="not-a-date")
+
+    curator = DiversityCurator(db=db, scorer=DiversityScorer(), llm_client=None)
+
+    # UN solo item candidato cuya categoría coincide con la fila corrupta.
+    # Si la fila se descarta correctamente, el historial efectivo está vacío
+    # y el scorer no aplica penalización → score 1.0.
+    only_item = _item(id=42, category="x", marketplace="amazon")
+    outbox = _make_outbox_with([only_item])
+
+    with caplog.at_level(
+        logging.WARNING, logger="ofertas_hunter.dispatching.diversity_curator"
+    ):
+        picked = await curator.pick(outbox, last_normal_publication_at=None, now=_now())
+
+    # Atajo de un solo candidato → pick devuelve directo sin tocar history.
+    # Para forzar el path que carga history, agregamos un segundo item.
+    second = _item(id=43, category="otra", marketplace="ml")
+    outbox2 = _make_outbox_with([only_item, second])
+    with caplog.at_level(
+        logging.WARNING, logger="ofertas_hunter.dispatching.diversity_curator"
+    ):
+        picked2 = await curator.pick(outbox2, last_normal_publication_at=None, now=_now())
+
+    assert picked is not None
+    assert picked2 is not None  # no exception, pick succeeded
+
+    warnings = [
+        rec for rec in caplog.records
+        if rec.name == "ofertas_hunter.dispatching.diversity_curator"
+        and rec.levelno == logging.WARNING
+    ]
+    assert any(
+        "unparseable sent_at" in rec.getMessage()
+        or "sent_at" in rec.getMessage()
+        for rec in warnings
+    ), f"Expected WARNING about unparseable sent_at, got: {[r.getMessage() for r in warnings]}"

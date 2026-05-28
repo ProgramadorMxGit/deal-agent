@@ -167,6 +167,10 @@ class DiversityCurator:
                 )
                 payload = json.loads(payload_raw)
             except Exception:
+                logger.warning(
+                    "DiversityCurator: skipping unparseable history row",
+                    exc_info=True,
+                )
                 continue
             sent_at_str = r["sent_at"] if "sent_at" in r.keys() else r[0]
             try:
@@ -174,7 +178,11 @@ class DiversityCurator:
                     str(sent_at_str).replace("Z", "+00:00")
                 )
             except Exception:
-                sent_at = datetime.now(timezone.utc)
+                logger.warning(
+                    "DiversityCurator: skipping history row with unparseable sent_at: %r",
+                    sent_at_str,
+                )
+                continue
             history.append(
                 HistoryEntry(
                     marketplace=payload.get("marketplace") or "unknown",
