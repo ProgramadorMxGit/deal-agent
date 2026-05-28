@@ -38,13 +38,19 @@ def _item(
     )
 
 
-def _hist(*, marketplace: str, category: str | None = None,
-          brand: str | None = None, price_bucket: str = "mid") -> HistoryEntry:
+def _hist(
+    *,
+    marketplace: str,
+    category: str | None = None,
+    brand: str | None = None,
+    bucket: str = "mid",
+) -> HistoryEntry:
+    """Construye una HistoryEntry. ``bucket`` evita shadowear ``price_bucket``."""
     return HistoryEntry(
         marketplace=marketplace,
         category=category,
         brand=brand,
-        price_bucket=price_bucket,
+        price_bucket=bucket,
         sent_at=_now(),
     )
 
@@ -71,7 +77,6 @@ def test_scorer_with_no_history_keeps_base_score():
     assert len(result) == 2
     # Sin historial, todos parten con score 1.0 (sin penalización ni bonus)
     assert all(c.score == pytest.approx(1.0) for c in result)
-
 
 
 def test_scorer_penalizes_repeated_category():
@@ -136,3 +141,89 @@ def test_scorer_orden_estable_cuando_scores_iguales():
     items = [_item(id=1), _item(id=2), _item(id=3)]
     result = scorer.rank(items, history=[])
     assert [c.item.id for c in result] == [1, 2, 3]
+
+
+def test_scorer_brand_penalty_path():
+    """Misma marca repetida 2 veces → ×0.7^2 = 0.49 sobre el item con esa marca."""
+    scorer = DiversityScorer()
+    items = [
+        _item(id=1, category="x", brand="logitech"),
+        _item(id=2, category="x", brand="razer"),
+    ]
+    history = [
+        _hist(marketplace="ml", category="otra", brand="logitech"),
+        _hist(marketplace="ml", category="otra", brand="logitech"),
+    ]
+    result = scorer.rank(items, history=history)
+    by_id = {c.item.id: c for c in result}
+    assert by_id[1].breakdown.get("brand_penalty") == pytest.approx(0.49)
+    assert "brand_penalty" not in by_id[2].breakdown
+    assert by_id[2].score > by_id[1].score
+
+
+def test_scorer_price_bucket_alternation_path():
+    """Mismo bucket de precio que la última publicación → ×0.85."""
+    scorer = DiversityScorer()
+    # current_price 1000 → bucket 'mid'; 100 → bucket 'low'
+    items = [
+        _item(id=1, category="x", current_price=1000.0),  # mid
+        _item(id=2, category="x", current_price=100.0),   # low
+    ]
+    # último publicado fue mid → item 1 cae en alternación
+    history = [_hist(marketplace="otro", category="otra", bucket="mid")]
+    result = scorer.rank(items, history=history)
+    by_id = {c.item.id: c for c in result}
+    assert by_id[1].breakdown.get("price_bucket_alternation") == pytest.approx(0.85)
+    assert "price_bucket_alternation" not in by_id[2].breakdown
+    assert by_id[2].score > by_id[1].score
+
+
+def test_scorer_combined_multipliers():
+    """Item que coincide en categoría + marca + marketplace + bucket recibe el producto de penalizaciones.
+
+    Histórico: 1 entrada con misma categoría, misma marca, mismo marketplace, mismo bucket.
+    Multiplicadores esperados:
+        category_penalty       = 0.5^1  = 0.5
+        brand_penalty          = 0.7^1  = 0.7
+        marketplace_alternation= 0.7
+        price_bucket_alternation=0.85
+    Producto = 0.5 * 0.7 * 0.7 * 0.85 = 0.20825
+    """
+    scorer = DiversityScorer()
+    items = [
+        _item(
+            id=1,
+            marketplace="amazon",
+            category="hogar",
+            brand="acme",
+            current_price=1000.0,  # bucket mid
+        ),
+    ]
+    history = [
+        _hist(marketplace="amazon", category="hogar", brand="acme", bucket="mid"),
+    ]
+    result = scorer.rank(items, history=history)
+    assert len(result) == 1
+    sc = result[0]
+    assert sc.breakdown["category_penalty"] == pytest.approx(0.5)
+    assert sc.breakdown["brand_penalty"] == pytest.approx(0.7)
+    assert sc.breakdown["marketplace_alternation"] == pytest.approx(0.7)
+    assert sc.breakdown["price_bucket_alternation"] == pytest.approx(0.85)
+    # Asegurar que NO se aplicó el bonus por categoría ausente (la categoría sí estaba en historial)
+    assert "category_absent_bonus" not in sc.breakdown
+    expected = 0.5 * 0.7 * 0.7 * 0.85
+    assert sc.score == pytest.approx(expected)
+
+
+def test_scorer_history_size_truncates_window():
+    """``history_size`` debe limitar la ventana de historial considerada.
+
+    Con ``history_size=2`` y un historial con 5 entradas de la misma categoría,
+    sólo deben contar las 2 más recientes → 0.5^2 = 0.25 (no 0.5^5 = 0.03125).
+    """
+    scorer = DiversityScorer(history_size=2)
+    items = [_item(id=1, category="repetida")]
+    history = [_hist(marketplace="ml", category="repetida") for _ in range(5)]
+    result = scorer.rank(items, history=history)
+    assert len(result) == 1
+    assert result[0].breakdown["category_penalty"] == pytest.approx(0.25)
