@@ -145,11 +145,30 @@ async def _h_discover_seeds(ctx: Any, args: dict) -> dict:
         except BrowserUnavailableError as exc:
             return {"error": "browser_unavailable", "detail": str(exc)}
 
+        # Auto-bootstrap: si el frontier de este marketplace está vacío
+        # (sin URLs para descubrir), siembra automáticamente desde
+        # `config/seeds/<marketplace>.json`. Esto hace al bot
+        # completamente autónomo: no depende de un setup manual previo.
+        seeded = 0
+        try:
+            total_in_frontier = agent.frontier.count_pending(marketplace)
+        except Exception:
+            total_in_frontier = 0
+
+        if total_in_frontier == 0:
+            seeded = _auto_seed_from_json(agent, marketplace)
+            if seeded:
+                logger.info(
+                    "discover_seeds(%s): frontier vacío, auto-sembrado %d URLs desde config/seeds/%s.json",
+                    marketplace, seeded, marketplace,
+                )
+
         agent.max_per_cycle = max(1, min(limit, 10))
         outcomes = await agent.discover_once()
         return {
             "success": True,
             "marketplace": marketplace,
+            "auto_seeded": seeded,
             "processed": len(outcomes),
             "discovered": sum(o.discovered_count for o in outcomes),
             "persisted": sum(o.persisted_count for o in outcomes),
@@ -164,6 +183,39 @@ async def _h_discover_seeds(ctx: Any, args: dict) -> dict:
                 for o in outcomes
             ],
         }
+
+
+def _auto_seed_from_json(agent: Any, marketplace: str) -> int:
+    """Carga `config/seeds/<marketplace>.json` al frontier vía agent.seed_from_config.
+
+    Defensivo: si el JSON no existe, está malformado o el agent no tiene
+    `seed_from_config`, retorna 0 sin lanzar excepción.
+    """
+    import json as _json
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[4]
+    seeds_path = repo_root / "config" / "seeds" / f"{marketplace}.json"
+    if not seeds_path.exists():
+        logger.warning("auto_seed: archivo no existe: %s", seeds_path)
+        return 0
+    try:
+        urls = _json.loads(seeds_path.read_text(encoding="utf-8"))
+        if not isinstance(urls, list):
+            logger.warning("auto_seed: %s no contiene una lista", seeds_path)
+            return 0
+    except Exception:
+        logger.exception("auto_seed: error leyendo %s", seeds_path)
+        return 0
+
+    if not hasattr(agent, "seed_from_config"):
+        logger.warning("auto_seed: agent %s no soporta seed_from_config", type(agent).__name__)
+        return 0
+    try:
+        return int(agent.seed_from_config(urls))
+    except Exception:
+        logger.exception("auto_seed: seed_from_config raised")
+        return 0
 
 
 # ---------------------------------------------------------------------------
