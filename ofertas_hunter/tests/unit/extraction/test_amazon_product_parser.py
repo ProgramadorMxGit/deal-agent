@@ -78,11 +78,13 @@ class TestAmazonExtraction:
 
     def test_amazon_calculates_discount_percent(self):
         product = _parse("jbl_normal_offer.html")
-        # Hay badge -57%, y también cálculo (57.51%).
-        assert product.discount_percent in (57, 57.0, 57.51)
+        # El parser ahora prioriza el cálculo sobre el badge.
+        # 1 - 388/899 ≈ 56.84% (calculated_discount usa redondeo
+        # interno, así que admitimos rango).
         assert product.calculated_discount_percent is not None
-        # 1 - 388/899 ≈ 56.84%
         assert 56.0 <= product.calculated_discount_percent <= 58.0
+        assert product.discount_percent is not None
+        assert 56.0 <= product.discount_percent <= 58.0
 
     def test_amazon_extracts_main_image(self):
         product = _parse("jbl_normal_offer.html")
@@ -106,6 +108,38 @@ class TestAmazonExtraction:
 
 
 class TestAntiFalsePositives:
+    def test_amazon_ignores_unit_price_as_current_price(self):
+        html = """
+        <html><body>
+          <h1 id="title"><span>200 Guantes de Nitrilo Vinil de Alta Calidad Color Negro</span></h1>
+          <div id="corePrice_desktop">
+            <span class="a-size-base a-color-secondary">
+              (<span class="a-price a-text-price"><span class="a-offscreen">$0.74</span></span> / unidad)
+            </span>
+            <span class="a-price priceToPay">
+              <span class="a-offscreen">$148.00</span>
+            </span>
+            <span class="basisPrice">
+              <span class="a-price a-text-price" data-a-strike="true">
+                <span class="a-offscreen">$222.00</span>
+              </span>
+            </span>
+          </div>
+          <img id="landingImage" src="https://m.media-amazon.com/images/I/test.jpg" />
+          <div id="availability"><span>En stock</span></div>
+        </body></html>
+        """
+
+        product = AmazonProductParser().parse(
+            html,
+            "https://www.amazon.com.mx/dp/B0C5KSKZM4",
+        )
+
+        assert product.current_price == 148.0
+        assert product.previous_price == 222.0
+        assert product.discount_percent is not None
+        assert 33 <= product.discount_percent <= 34
+
     def test_amazon_detects_monthly_payment_not_total_price(self):
         product = _parse("monthly_payment_only.html")
         assert product.is_monthly_payment is True
@@ -175,7 +209,9 @@ class TestExtremeCases:
         )
         assert product.current_price == 3899.0
         assert product.previous_price == 32999.0
-        assert product.discount_percent == 88
+        # 1 - 3899/32999 ≈ 88.18% — el parser usa cálculo real ahora.
+        assert product.discount_percent is not None
+        assert 87.5 <= product.discount_percent <= 88.5
         assert product.in_stock is True
         assert product.title.startswith("Apple iPhone 16 Pro Max")
         assert product.is_publishable is True

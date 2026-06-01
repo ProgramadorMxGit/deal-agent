@@ -296,6 +296,56 @@ def _insert_published_row(
     )
 
 
+def _insert_product_offer_outbox_row(
+    db: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    offer_id: int,
+    product_id: int,
+    marketplace: str,
+    title: str,
+    brand: str | None,
+    category: str | None,
+    payload_json: str,
+) -> None:
+    now = "2026-05-28T09:00:00.000Z"
+    db.execute(
+        """
+        INSERT INTO products (
+            id, marketplace, marketplace_id, url_canonical, title, brand, category,
+            condition, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+        """,
+        (
+            product_id,
+            marketplace,
+            f"{marketplace}-{product_id}",
+            f"https://example.com/{product_id}",
+            title,
+            brand,
+            category,
+            now,
+            now,
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO offers (
+            id, product_id, classification, score, reasons_json, state, created_at, updated_at
+        ) VALUES (?, ?, 'normal_offer', 60, '[]', 'eligible', ?, ?)
+        """,
+        (offer_id, product_id, now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO outbox (
+            id, offer_id, type, enqueued_at, state, attempts, message_payload_json
+        ) VALUES (?, ?, 'normal', ?, 'pending', 0, ?)
+        """,
+        (outbox_id, offer_id, now, payload_json),
+    )
+
+
 @pytest.mark.asyncio
 async def test_curator_skips_history_row_with_bad_json(db, caplog):
     """Si `message_payload_json` no es JSON válido, la fila se descarta y se loguea WARNING."""
@@ -382,3 +432,97 @@ async def test_curator_skips_history_row_with_bad_sent_at(db, caplog):
         or "sent_at" in rec.getMessage()
         for rec in warnings
     ), f"Expected WARNING about unparseable sent_at, got: {[r.getMessage() for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_curator_uses_product_metadata_for_history_when_payload_missing(db):
+    _insert_product_offer_outbox_row(
+        db,
+        outbox_id=500,
+        offer_id=500,
+        product_id=500,
+        marketplace="mercadolibre",
+        title="Transportadora mascota",
+        brand="fancy",
+        category="bolsas y transportadoras",
+        payload_json='{"marketplace": "mercadolibre", "current_price": 999.0}',
+    )
+    _insert_published_row(db, outbox_id=500, sent_at="2026-05-28T11:00:00.000Z")
+
+    curator = DiversityCurator(db=db, scorer=DiversityScorer(), llm_client=None)
+    outbox = _make_outbox_with(
+        [
+            _item(id=1, category="bolsas y transportadoras", marketplace="mercadolibre"),
+            _item(id=2, category="cuidado personal", marketplace="amazon"),
+        ]
+    )
+
+    picked = await curator.pick(outbox, None, _now())
+    assert picked is not None
+    assert picked.id == 2
+
+
+@pytest.mark.asyncio
+async def test_curator_enriches_candidates_from_product_metadata_when_payload_missing(db):
+    _insert_product_offer_outbox_row(
+        db,
+        outbox_id=600,
+        offer_id=600,
+        product_id=600,
+        marketplace="mercadolibre",
+        title="Historial transporte",
+        brand="fancy",
+        category="bolsas y transportadoras",
+        payload_json='{"marketplace": "mercadolibre", "category": "bolsas y transportadoras", "current_price": 999.0}',
+    )
+    _insert_published_row(db, outbox_id=600, sent_at="2026-05-28T11:00:00.000Z")
+
+    curator = DiversityCurator(db=db, scorer=DiversityScorer(), llm_client=None)
+    candidates = [
+        OutboxItem(
+            id=601,
+            offer_id=601,
+            type=OutboxType.NORMAL.value,
+            message_payload={"title": "Otra transportadora", "marketplace": "mercadolibre", "current_price": 1200.0},
+            enqueued_at=_now(),
+            attempts=0,
+            state=OutboxState.PENDING.value,
+        ),
+        OutboxItem(
+            id=602,
+            offer_id=602,
+            type=OutboxType.NORMAL.value,
+            message_payload={"title": "Protector solar", "marketplace": "amazon", "current_price": 1100.0},
+            enqueued_at=_now(),
+            attempts=0,
+            state=OutboxState.PENDING.value,
+        ),
+    ]
+    _insert_product_offer_outbox_row(
+        db,
+        outbox_id=601,
+        offer_id=601,
+        product_id=601,
+        marketplace="mercadolibre",
+        title="Otra transportadora",
+        brand="fancy",
+        category="bolsas y transportadoras",
+        payload_json='{"marketplace": "mercadolibre", "current_price": 1200.0}',
+    )
+    _insert_product_offer_outbox_row(
+        db,
+        outbox_id=602,
+        offer_id=602,
+        product_id=602,
+        marketplace="amazon",
+        title="Protector solar",
+        brand="isdin",
+        category="Filtro Solar Corporal",
+        payload_json='{"marketplace": "amazon", "current_price": 1100.0}',
+    )
+
+    outbox = _make_outbox_with(candidates)
+    picked = await curator.pick(outbox, None, _now())
+    assert picked is not None
+    assert picked.id == 602
+    assert picked.message_payload["category"] == "Filtro Solar Corporal"

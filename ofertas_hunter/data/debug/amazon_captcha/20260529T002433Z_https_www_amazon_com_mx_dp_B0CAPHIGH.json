@@ -1,0 +1,26 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0CAPHIGH",
+  "final_url": "https://www.amazon.com.mx/dp/B0CAPHIGH",
+  "status": 200,
+  "duration_ms": null,
+  "blocked": true,
+  "error": "captcha_detected",
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "high",
+    "strong_signals": [
+      "form_action_validate_captcha"
+    ],
+    "weak_signals": [
+      "validateCaptcha"
+    ],
+    "visible_signals": [
+      "text_continuar_comprando"
+    ],
+    "should_pause_marketplace": true,
+    "reasons": [
+      "body_tiny_with_amazon_title"
+    ]
+  },
+  "captured_at": "2026-05-29T00:24:33.553Z"
+}

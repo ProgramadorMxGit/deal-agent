@@ -5,7 +5,8 @@ Responsabilidades:
 1. Conectar a Telegram via `TelegramAdapter` (Telethon en producción, Fake en
    tests).
 2. Resolver canales `TELEGRAM_TARGET_CHANNELS` (usernames, títulos, ids).
-3. Hacer backfill al arrancar (`TELEGRAM_BACKFILL_LIMIT_PER_CHANNEL`).
+3. En modo automático, inicializar cursor al mensaje más reciente y procesar
+   sólo mensajes nuevos desde ese punto.
 4. Procesar nuevos mensajes via N workers paralelos
    (`TELEGRAM_CHANNEL_WORKERS`).
 5. Para cada mensaje:
@@ -119,6 +120,7 @@ class TelegramListenerConfig:
     link_resolver_timeout_seconds: float = 6.0
     link_resolver_max_redirects: int = 5
     normal_offer_min_discount: float = 50.0
+    start_from_now: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +168,7 @@ class TelegramListenerAgent:
             max_redirects=config.link_resolver_max_redirects,
             cache_conn=db_conn,
         )
+        self._memory_cursors: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -224,18 +227,99 @@ class TelegramListenerAgent:
             budget = self.config.backfill_process_budget_per_channel
             for entry, chat_id, display in channels:
                 processed = 0
-                async for msg in self.adapter.fetch_history(
-                    chat_id, display, limit=self.config.backfill_limit_per_channel
-                ):
+                cursor = self._get_cursor(chat_id) if self.config.start_from_now else None
+                fetch_limit = (
+                    1
+                    if self.config.start_from_now and cursor is None
+                    else self.config.backfill_limit_per_channel
+                )
+                messages = [
+                    msg
+                    async for msg in self.adapter.fetch_history(
+                        chat_id, display, limit=fetch_limit
+                    )
+                ]
+                if self.config.start_from_now:
+                    if cursor is None:
+                        latest = max((msg.message_id for msg in messages), default=None)
+                        if latest is not None:
+                            self._set_cursor(chat_id, latest)
+                            logger.info(
+                                "telegram start_from_now initialized channel=%s chat_id=%s cursor=%s",
+                                display,
+                                chat_id,
+                                latest,
+                            )
+                        continue
+                    messages = [msg for msg in messages if msg.message_id > cursor]
+                    messages.sort(key=lambda msg: msg.message_id)
+
+                max_seen = self._get_cursor(chat_id)
+                for msg in messages:
                     if processed >= budget:
                         break
                     outcome = await self._process_one(msg)
                     outcomes.append(outcome)
                     if not outcome.duplicate:
                         processed += 1
+                    if self.config.start_from_now:
+                        max_seen = max(max_seen or 0, msg.message_id)
+                if self.config.start_from_now and max_seen is not None:
+                    self._set_cursor(chat_id, max_seen)
         finally:
             await self.adapter.disconnect()
         return outcomes
+
+    def _get_cursor(self, chat_id: int) -> Optional[int]:
+        if self.db is None:
+            return self._memory_cursors.get(chat_id)
+        try:
+            row = self.db.execute(
+                "SELECT payload_json FROM runtime_events "
+                "WHERE kind = 'telegram_listener_cursor' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is None or not row["payload_json"]:
+                return None
+            payload = json.loads(row["payload_json"])
+            value = (payload.get("cursors") or {}).get(str(chat_id))
+            return int(value) if value is not None else None
+        except Exception:
+            logger.exception("telegram listener cursor load failed")
+            return None
+
+    def _set_cursor(self, chat_id: int, message_id: int) -> None:
+        if self.db is None:
+            self._memory_cursors[chat_id] = message_id
+            return
+        try:
+            row = self.db.execute(
+                "SELECT payload_json FROM runtime_events "
+                "WHERE kind = 'telegram_listener_cursor' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            cursors: dict[str, int] = {}
+            if row is not None and row["payload_json"]:
+                payload = json.loads(row["payload_json"])
+                cursors = {
+                    str(k): int(v)
+                    for k, v in (payload.get("cursors") or {}).items()
+                    if v is not None
+                }
+            cursors[str(chat_id)] = int(message_id)
+            self.db.execute("DELETE FROM runtime_events WHERE kind = 'telegram_listener_cursor'")
+            self.db.execute(
+                "INSERT INTO runtime_events (kind, severity, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "telegram_listener_cursor",
+                    "debug",
+                    json.dumps({"cursors": cursors}, ensure_ascii=False),
+                    _utcnow_iso(),
+                ),
+            )
+        except Exception:
+            logger.exception("telegram listener cursor save failed")
 
     async def listen_once(self) -> Optional[ProcessingOutcome]:
         """Procesa un solo mensaje en vivo (útil para `--once`)."""

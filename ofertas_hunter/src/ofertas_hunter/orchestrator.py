@@ -1,22 +1,22 @@
-"""Orchestrator: arma el grafo completo de agentes según `.env`.
+﻿"""Orchestrator: arma el grafo completo de agentes segâ”œâ•‘n `.env`.
 
 Responsabilidades:
 
-- Construir y registrar al `RuntimeWatchdog` los agentes que estén
+- Construir y registrar al `RuntimeWatchdog` los agentes que estâ”œÂ®n
   habilitados (`AMAZON_ENABLED`, `MERCADOLIBRE_ENABLED`, `TELEGRAM_ENABLED`,
-  publicación siempre activa pero respeta `PUBLISHING_ENABLED`).
+  publicaciâ”œâ”‚n siempre activa pero respeta `PUBLISHING_ENABLED`).
 - Cada agente es una **factory** `(handle, registry) -> Awaitable[None]` que:
-  1. Llama a `registry.heartbeat(handle)` periódicamente.
+  1. Llama a `registry.heartbeat(handle)` periâ”œâ”‚dicamente.
   2. Hace su unidad de trabajo (un tick del dispatcher, un backfill de
-     Telegram, un ciclo de hunt sobre N seeds, …).
+     Telegram, un ciclo de hunt sobre N seeds, Ã”Ã‡Âª).
   3. Espera el `loop_interval` configurado y repite.
   4. Si `--once` se pasa al `run`, sale tras el primer ciclo.
 - Si una dependencia opcional falla (Playwright no instalado, cookies
   ausentes, etc.), el agente queda registrado pero **dormita**: emite un
   `runtime_event(severity=warning, kind=agent_skipped)` y reintenta
-  periódicamente. No crashea ni arrastra al watchdog.
+  periâ”œâ”‚dicamente. No crashea ni arrastra al watchdog.
 
-Las factories están desacopladas para que los tests usen
+Las factories estâ”œÃ­n desacopladas para que los tests usen
 `AgentRegistrar` con stubs en vez del builder real.
 """
 
@@ -39,17 +39,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tipos y configuración
+# Tipos y configuraciâ”œâ”‚n
 # ---------------------------------------------------------------------------
 
 
-# Una factory recibe (handle, registry) y devuelve coroutine de larga duración.
+# Una factory recibe (handle, registry) y devuelve coroutine de larga duraciâ”œâ”‚n.
 AgentFactoryFn = Callable[[AgentRunHandle, AgentRunRegistry], Awaitable[None]]
 
 
 @dataclass
 class OrchestratorConfig:
-    """Parámetros operativos. Pueden venir de `.env` o ser inyectados."""
+    """Parâ”œÃ­metros operativos. Pueden venir de `.env` o ser inyectados."""
 
     once: bool = False
     dispatcher_loop_interval: float = 5.0
@@ -70,10 +70,10 @@ class OrchestratorConfig:
     hibernate_end: str = "06:30"
     warmup_start: str = "06:30"
     active_start: str = "07:00"
-    # En warmup, los hunters trabajan más rápido para llenar el outbox.
+    # En warmup, los hunters trabajan mâ”œÃ­s râ”œÃ­pido para llenar el outbox.
     warmup_loop_interval: float = 90.0
-    # En hibernación, los loops despiertan periódicamente sólo para
-    # comprobar si el modo cambió. No fetchean.
+    # En hibernaciâ”œâ”‚n, los loops despiertan periâ”œâ”‚dicamente sâ”œâ”‚lo para
+    # comprobar si el modo cambiâ”œâ”‚. No fetchean.
     hibernation_check_interval: float = 60.0
 
 
@@ -97,7 +97,7 @@ class AgentFactoryBuilder:
     """Genera factories listas para `RuntimeWatchdog.register()`.
 
     Esta clase no toca `.env` directamente: recibe `Settings` ya resuelta.
-    Las factories reales (que abren Playwright/Telethon) viven aquí, pero
+    Las factories reales (que abren Playwright/Telethon) viven aquâ”œÂ¡, pero
     los tests pueden subclasear y devolver factories triviales.
     """
 
@@ -110,7 +110,7 @@ class AgentFactoryBuilder:
         self.db = conn
         self.settings = settings
         self.config = config
-        # Único scheduler compartido por todos los agentes y el dispatcher.
+        # â”œÃœnico scheduler compartido por todos los agentes y el dispatcher.
         from .runtime.scheduler import OperatingScheduler, ScheduleConfig
 
         sched_config = ScheduleConfig.from_env(
@@ -149,14 +149,14 @@ class AgentFactoryBuilder:
         hibernation_check_interval: float = 60.0,
         respect_schedule: bool = True,
     ) -> None:
-        """Loop genérico con heartbeat + modo según scheduler.
+        """Loop genâ”œÂ®rico con heartbeat + modo segâ”œâ•‘n scheduler.
 
-        Si `scheduler` está y `respect_schedule=True`, el loop:
-        - en `hibernating` → no llama a `work()`, sólo heartbeat cada
+        Si `scheduler` estâ”œÃ­ y `respect_schedule=True`, el loop:
+        - en `hibernating` Ã”Ã¥Ã† no llama a `work()`, sâ”œâ”‚lo heartbeat cada
           `hibernation_check_interval`.
-        - en `warmup` → usa `warmup_interval` (más corto) en lugar de
+        - en `warmup` Ã”Ã¥Ã† usa `warmup_interval` (mâ”œÃ­s corto) en lugar de
           `interval`.
-        - en `active` → usa `interval`.
+        - en `active` Ã”Ã¥Ã† usa `interval`.
         """
         from .runtime.scheduler import ScheduleMode
 
@@ -199,7 +199,7 @@ class AgentFactoryBuilder:
     def make_dispatcher_factory(self) -> AgentFactoryFn:
         """Factory para el outbox dispatcher.
 
-        Si la config Evolution está incompleta, sigue corriendo: los items
+        Si la config Evolution estâ”œÃ­ incompleta, sigue corriendo: los items
         se quedan pendientes. Si `PUBLISHING_ENABLED=false`, el publisher
         retorna `skipped=True` (ver `WhatsAppPublisher`).
         """
@@ -207,20 +207,64 @@ class AgentFactoryBuilder:
         from .dispatching.curator_factory import build_diversity_curator
         from .dispatching.dispatcher import (
             OutboxDispatcher,
+            RevalidationResult,
+            make_sqlite_duplicate_checker,
             make_sqlite_published_recorder,
+            make_stale_price_checker,
         )
         from .dispatching.outbox import OutboxConfig, SqliteOutbox
+        from .revalidation.playwright_revalidator import PlaywrightRevalidator
         from .publishing.evolution_client import EvolutionClient
         from .publishing.whatsapp_publisher import WhatsAppPublisher
 
         s = self.settings
         cfg = self.config
+        db_conn = self.db
 
         async def factory(handle: AgentRunHandle, registry: AgentRunRegistry) -> None:
+            browser_holder: list[Any] = []
+            revalidator_holder: list[Any] = []
+
+            class _LazyRevalidator:
+                async def revalidate(self, item):
+                    if not revalidator_holder:
+                        try:
+                            from .browser.browser_context import BrowserConfig
+                            from .browser.playwright_worker import PlaywrightBrowserWorker
+
+                            browser = PlaywrightBrowserWorker(
+                                BrowserConfig(
+                                    headless=s.amazon_headless,
+                                    user_data_dir=s.amazon_user_data_dir,
+                                    warmup_amazon_homepage=s.amazon_warmup_homepage,
+                                    delay_between_requests_ms=(
+                                        s.amazon_delay_between_pages_ms_min,
+                                        s.amazon_delay_between_pages_ms_max,
+                                    ),
+                                )
+                            )
+                            await browser._ensure_started()  # noqa: SLF001
+                            browser_holder.append(browser)
+                            revalidator_holder.append(
+                                PlaywrightRevalidator(browser=browser, db_conn=db_conn)
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "dispatcher revalidator unavailable item=%s: %s",
+                                item.id,
+                                exc,
+                            )
+                            return RevalidationResult(
+                                still_eligible=True,
+                                payload=item.message_payload,
+                            )
+                    return await revalidator_holder[0].revalidate(item)
+
             client = EvolutionClient(
                 base_url=s.evolution_base_url,
                 api_key=s.evolution_api_key,
                 instance=s.evolution_instance,
+                api_key_header=s.evolution_api_key_header,
                 dry_run=s.publishing_dry_run,
             )
             publisher = WhatsAppPublisher(
@@ -228,6 +272,10 @@ class AgentFactoryBuilder:
                 target_group_id=s.whatsapp_group,
                 enabled=s.publishing_enabled,
                 mercadolibre_affiliate_required=s.mercadolibre_affiliate_required_for_publish,
+                amazon_affiliate_required=s.amazon_affiliate_required_for_publish,
+                amazon_min_discount_percent=s.amazon_min_discount_percent,
+                amazon_extreme_discount_threshold=s.amazon_extreme_discount_threshold,
+                amazon_min_absolute_price=s.amazon_min_absolute_price,
             )
             outbox = SqliteOutbox(
                 self.db,
@@ -236,9 +284,15 @@ class AgentFactoryBuilder:
                     cooldown=CooldownPolicy(cooldown_seconds=s.whatsapp_cooldown_seconds),
                 ),
             )
-            # Diversity curator: si la feature está habilitada en settings,
-            # lo inyectamos como `item_selector`. Cuando es None el dispatcher
-            # mantiene el path legacy (`pick_random_eligible`).
+            dup_checker = make_sqlite_duplicate_checker(self.db, hours=48)
+            stale_checker = make_stale_price_checker(max_age_hours=4)
+
+            def _combined_checker(item):
+                return dup_checker(item) or stale_checker(item)
+
+            # Diversity curator: si la feature estâ”œÃ­ habilitada, lo inyectamos
+            # como item_selector; si estâ”œÃ­ deshabilitada (default), el
+            # dispatcher conserva el comportamiento legacy.
             curator = build_diversity_curator(self.db, s)
             item_selector = curator.pick if curator is not None else None
 
@@ -246,7 +300,9 @@ class AgentFactoryBuilder:
                 outbox=outbox,
                 publisher=publisher,
                 published_recorder=make_sqlite_published_recorder(self.db),
+                duplicate_checker=_combined_checker,
                 item_selector=item_selector,
+                revalidator=_LazyRevalidator(),
                 idle_sleep_seconds=cfg.dispatcher_loop_interval,
                 scheduler=self.scheduler,
             )
@@ -263,6 +319,11 @@ class AgentFactoryBuilder:
                     work=work,
                 )
             finally:
+                for browser in browser_holder:
+                    try:
+                        await browser.aclose()
+                    except Exception:
+                        logger.exception("dispatcher revalidator browser close failed")
                 await client.aclose()
 
         return factory
@@ -272,6 +333,12 @@ class AgentFactoryBuilder:
             self._emit_skip("amazon_hunter", "amazon_disabled")
             return None
 
+        # Switch criterio B: si el flag legacy estâ”œÃ­ activo, retornamos
+        # un factory completamente distinto. NO se levantan dos hunters
+        # Amazon: el orquestador llama solo a este o solo al nuevo.
+        if self.settings.amazon_hunter_legacy:
+            return self._make_legacy_amazon_hunter_factory()
+
         from .agents.amazon_hunter_agent import AmazonHunterAgent
         from .agents.discovery_agent import DiscoveryAgent
         from .browser.browser_context import BrowserConfig
@@ -279,6 +346,8 @@ class AgentFactoryBuilder:
             PlaywrightBrowserWorker,
             PlaywrightImportError,
         )
+        from .marketplaces.amazon_affiliate import PlaywrightAffiliateExtractor
+        from .session.amazon_session import AmazonSession
 
         seeds = list(self.config.amazon_seeds)
         cfg = self.config
@@ -316,35 +385,165 @@ class AgentFactoryBuilder:
                 )
                 return
 
-            hunter = AmazonHunterAgent(browser=browser, db_conn=self.db)
+            try:
+                async with browser:
+                    session = AmazonSession.from_settings(
+                        cookies_path=s.amazon_cookies_path,
+                    )
+                    await session.inject_into_browser(browser)
+                    hunter = AmazonHunterAgent(
+                        browser=browser,
+                        db_conn=self.db,
+                        affiliate_extractor=PlaywrightAffiliateExtractor(
+                            browser._context  # noqa: SLF001
+                        ),
+                    )
+                    discovery = DiscoveryAgent(
+                        browser=browser,
+                        db_conn=self.db,
+                        marketplace="amazon",
+                        max_per_cycle=2,
+                    )
+                    seeded = discovery.seed_from_config(seeds)
+                    if seeded:
+                        logger.info("amazon discovery: %d seeds aâ”œâ–’adidas al frontier", seeded)
+
+                    async def work() -> None:
+                        await discovery.discover_once()
+                        outcomes = await hunter.hunt_from_frontier(
+                            max_urls=cfg.amazon_hunt_limit
+                        )
+                        if outcomes:
+                            logger.info(
+                                "amazon hunt: procesados=%d encolados=%d descartados=%d",
+                                len(outcomes),
+                                sum(1 for o in outcomes if o.enqueued_outbox_id is not None),
+                                sum(1 for o in outcomes if o.discarded_reason),
+                            )
+
+                    await self._loop(
+                        handle=handle,
+                        registry=registry,
+                        once=cfg.once,
+                        interval=cfg.amazon_loop_interval,
+                        work=work,
+                        scheduler=self.scheduler,
+                        warmup_interval=cfg.warmup_loop_interval,
+                        hibernation_check_interval=cfg.hibernation_check_interval,
+                    )
+            finally:
+                try:
+                    await hunter.aclose()
+                except UnboundLocalError:
+                    pass
+
+        return factory
+
+    def _make_legacy_amazon_hunter_factory(self) -> AgentFactoryFn:
+        """Factory para `LegacyAmazonHunterAgent`.
+
+        Usa `LegacyAmazonWorker` (browser efâ”œÂ¡mero anti-captcha del scraper
+        legacy) en lugar de `PlaywrightBrowserWorker`. Procesa frontier
+        compartido vâ”œÂ¡a `hunt_from_frontier`. NO hace discovery (criterio
+        5 spec).
+        """
+        from .agents.legacy_amazon_hunter_agent import LegacyAmazonHunterAgent
+        from .agents.discovery_agent import DiscoveryAgent
+        from .browser.browser_context import BrowserConfig
+        from .browser.playwright_worker import (
+            PlaywrightBrowserWorker,
+            PlaywrightImportError,
+        )
+
+        seeds = list(self.config.amazon_seeds)
+        cfg = self.config
+        s = self.settings
+
+        async def factory(handle: AgentRunHandle, registry: AgentRunRegistry) -> None:
+            # Discovery sigue usando el browser persistente nuevo: el
+            # legacy es solo para fetch de productos. Discovery seedea
+            # listings/categorâ”œÂ¡as al frontier compartido.
+            try:
+                discovery_browser = PlaywrightBrowserWorker(
+                    BrowserConfig(
+                        headless=s.amazon_headless,
+                        user_data_dir=s.amazon_user_data_dir,
+                        warmup_amazon_homepage=s.amazon_warmup_homepage,
+                        delay_between_requests_ms=(
+                            s.amazon_delay_between_pages_ms_min,
+                            s.amazon_delay_between_pages_ms_max,
+                        ),
+                    )
+                )
+            except PlaywrightImportError as exc:
+                emit_runtime_event(
+                    self.db,
+                    kind="agent_skipped",
+                    severity="warning",
+                    payload={
+                        "agent": "amazon_hunter_legacy",
+                        "reason": f"playwright_missing: {exc}",
+                    },
+                )
+
+                async def idle() -> None:
+                    await asyncio.sleep(60)
+
+                await self._loop(
+                    handle=handle,
+                    registry=registry,
+                    once=cfg.once,
+                    interval=cfg.amazon_loop_interval,
+                    work=idle,
+                )
+                return
+
+            # Hunter legacy: browser efâ”œÂ¡mero distinto, sin user_data_dir
+            # ni warmup vâ”œÂ¡a persistent_context (eso lo hace el worker
+            # legacy a su manera).
+            hunter = LegacyAmazonHunterAgent(
+                db_conn=self.db,
+                warmup_homepage=True,
+                delay_between_requests_ms=(
+                    s.amazon_delay_between_pages_ms_min,
+                    s.amazon_delay_between_pages_ms_max,
+                ),
+            )
             discovery = DiscoveryAgent(
-                browser=browser,
+                browser=discovery_browser,
                 db_conn=self.db,
                 marketplace="amazon",
                 max_per_cycle=2,
             )
-            # Sembrar listings/categorías al frontier (idempotente)
             seeded = discovery.seed_from_config(seeds)
             if seeded:
-                logger.info("amazon discovery: %d seeds añadidas al frontier", seeded)
+                logger.info(
+                    "amazon_legacy discovery: %d seeds aâ”œâ–’adidas al frontier",
+                    seeded,
+                )
 
             async def work() -> None:
-                # 1) Descubrir productos en listings/categorías → frontier
+                # 1) Discovery con browser persistente (nuevo) Ã”Ã¥Ã† frontier
                 await discovery.discover_once()
-                # 2) Procesar productos del frontier
+                # 2) Hunt productos del frontier con browser legacy
                 outcomes = await hunter.hunt_from_frontier(
                     max_urls=cfg.amazon_hunt_limit
                 )
                 if outcomes:
                     logger.info(
-                        "amazon hunt: procesados=%d encolados=%d descartados=%d",
+                        "amazon_legacy hunt: procesados=%d encolados=%d descartados=%d captchas_high=%d",
                         len(outcomes),
                         sum(1 for o in outcomes if o.enqueued_outbox_id is not None),
                         sum(1 for o in outcomes if o.discarded_reason),
+                        sum(
+                            1
+                            for o in outcomes
+                            if o.captcha_should_pause_marketplace
+                        ),
                     )
 
             try:
-                async with browser:
+                async with discovery_browser:
                     await self._loop(
                         handle=handle,
                         registry=registry,
@@ -412,7 +611,7 @@ class AgentFactoryBuilder:
                 )
                 return
 
-            await browser._ensure_started()  # noqa: SLF001 — necesitamos el context
+            await browser._ensure_started()  # noqa: SLF001 Ã”Ã‡Ã¶ necesitamos el context
 
             session = MercadoLibreSession.from_settings(
                 cookies_path=s.mercadolibre_cookies_path,
@@ -461,10 +660,14 @@ class AgentFactoryBuilder:
                 db_conn=self.db,
                 marketplace="mercadolibre",
                 max_per_cycle=2,
+                listing_discount_prefilter=s.mercadolibre_listing_discount_prefilter,
+                listing_min_discount=s.normal_offer_min_discount,
+                listing_discount_strict=s.mercadolibre_listing_discount_strict,
+                listing_unknown_discount_score=s.mercadolibre_listing_unknown_discount_score,
             )
             seeded = discovery.seed_from_config(seeds)
             if seeded:
-                logger.info("ml discovery: %d seeds añadidas al frontier", seeded)
+                logger.info("ml discovery: %d seeds aâ”œâ–’adidas al frontier", seeded)
 
             async def work() -> None:
                 if hunter.paused:
@@ -519,7 +722,7 @@ class AgentFactoryBuilder:
         cfg = self.config
 
         async def factory(handle: AgentRunHandle, registry: AgentRunRegistry) -> None:
-            # Lazy import: si Telethon no está instalado, dormita.
+            # Lazy import: si Telethon no estâ”œÃ­ instalado, dormita.
             try:
                 from .telegram.telethon_listener import (
                     TelethonAdapter,
@@ -560,6 +763,8 @@ class AgentFactoryBuilder:
                 ignore_mercadolibre_links=s.telegram_ignore_mercadolibre_links,
                 link_resolver_timeout_seconds=s.telegram_link_resolver_timeout_seconds,
                 link_resolver_max_redirects=s.telegram_link_resolver_max_redirects,
+                normal_offer_min_discount=s.normal_offer_min_discount,
+                start_from_now=s.telegram_start_from_now,
             )
 
             try:
@@ -697,7 +902,7 @@ class Orchestrator:
         )
         report.registered.append("outbox_dispatcher")
 
-        # Hunters según flags
+        # Hunters segâ”œâ•‘n flags
         amazon = self.builder.make_amazon_hunter_factory()
         if amazon is not None:
             self.watchdog.register("amazon_hunter", amazon)
@@ -738,15 +943,55 @@ class Orchestrator:
             },
         )
 
+        # Ã”Ã¶Ã‡Ã”Ã¶Ã‡ ML Session Recovery Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡Ã”Ã¶Ã‡
+        # Arranca el monitor de cookies + webhook entrante junto con el
+        # orquestador. Detecta cookie_expiry Ã”Ã¥Ã† avisa al admin via
+        # WhatsApp Ã”Ã¥Ã† recibe JSON Ã”Ã¥Ã† hot-reload sin reiniciar.
+        from .session.ml_session_alerting import build_ml_session_alert_sender
+        from .session.ml_session_runtime import MLSessionRecoveryRuntime
+
+        async def _evolution_send_for_recovery(number: str, text: str) -> bool:
+            try:
+                # En el Orchestrator nativo no tenemos ctx directo.
+                # Construimos un cliente Evolution temporal.
+                from .publishing.evolution_client import EvolutionClient
+                client = EvolutionClient(
+                    base_url=self.settings.evolution_base_url,
+                    api_key=self.settings.evolution_api_key,
+                    instance=self.settings.evolution_instance,
+                    api_key_header=self.settings.evolution_api_key_header,
+                    dry_run=self.settings.publishing_dry_run,
+                )
+                async with client:
+                    resp = await client.send_text(number, text)
+                return bool(resp.success)
+            except Exception as exc:
+                logger.warning("ML Recovery send_text fallâ”œâ”‚: %s", exc)
+                return False
+
+        alert_send = build_ml_session_alert_sender(
+            self.settings,
+            whatsapp_send=_evolution_send_for_recovery,
+        )
+
+        ml_recovery = MLSessionRecoveryRuntime.build(
+            settings=self.settings,
+            db=self.db,
+            evolution_send=_evolution_send_for_recovery,
+            alert_send=alert_send,
+            ctx=None,  # sin ctx: hot-reload escribe a disco; el prâ”œâ”‚ximo
+                       # ciclo del hunter ML cargarâ”œÃ­ las cookies frescas.
+        )
+        await ml_recovery.start()
+
         await self.watchdog.start_all()
 
         if self.config.once:
-            # Modo --once: esperamos a que cada task termine y salimos.
             await self._await_all()
             await self.watchdog.shutdown_all()
+            await ml_recovery.stop()
             return
 
-        # Modo continuo: el watchdog corre forever.
         try:
             await self.watchdog.run_forever()
         except asyncio.CancelledError:
@@ -758,6 +1003,7 @@ class Orchestrator:
                 severity="info",
                 payload={},
             )
+            await ml_recovery.stop()
 
     async def stop(self) -> None:
         await self.watchdog.stop()
@@ -767,14 +1013,14 @@ class Orchestrator:
         if not tasks:
             return
         # Esperamos con timeout de seguridad (los loops de --once deben
-        # terminar rápido).
+        # terminar râ”œÃ­pido).
         try:
             await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
                 timeout=120.0,
             )
         except asyncio.TimeoutError:
-            logger.warning("--once tardó >120s; cancelando tasks restantes")
+            logger.warning("--once tardâ”œâ”‚ >120s; cancelando tasks restantes")
 
 
 # ---------------------------------------------------------------------------

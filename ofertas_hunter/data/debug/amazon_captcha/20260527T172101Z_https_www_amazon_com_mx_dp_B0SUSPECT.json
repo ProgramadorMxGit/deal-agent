@@ -1,0 +1,22 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0SUSPECT",
+  "final_url": "https://www.amazon.com.mx/dp/B0SUSPECT",
+  "status": 503,
+  "duration_ms": null,
+  "blocked": false,
+  "error": "net::ERR_TIMED_OUT",
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "medium",
+    "strong_signals": [
+      "url_validate_captcha"
+    ],
+    "weak_signals": [],
+    "visible_signals": [],
+    "should_pause_marketplace": false,
+    "reasons": [
+      "medium_no_visible_text"
+    ]
+  },
+  "captured_at": "2026-05-27T17:21:01.538Z"
+}

@@ -35,6 +35,27 @@ from .formatter import (
 logger = logging.getLogger(__name__)
 
 
+def _is_valid_affiliate_url(url: Optional[str]) -> bool:
+    """True si la URL es un enlace de afiliado Amazon válido.
+
+    Un enlace válido contiene `amzn.to/` (link corto SiteStripe) o `tag=`
+    (parámetro de afiliado). Cualquier otra URL (incluida la directa
+    `amazon.com.mx/dp/...` sin tag) se considera inválida.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    return ("amzn.to/" in url) or ("tag=" in url)
+
+
+# Texto que delata precio por unidad / pieza / cuota dentro del raw text del
+# precio actual. Si el `current_price_raw_text` lo contiene, el precio
+# extraído NO es el total y NO debe publicarse (falso positivo 99/100%).
+_UNIT_PRICE_TEXT_RE = re.compile(
+    r"(/|\bpor\b)\s*(unidad(?:es)?|unid\.?|pieza(?:s)?|pza\.?|pz\.?|count|each|recuento)\b",
+    re.IGNORECASE,
+)
+
+
 # ---------------------------------------------------------------------------
 # Resultado
 # ---------------------------------------------------------------------------
@@ -76,6 +97,10 @@ class WhatsAppPublisher:
         *,
         enabled: bool = True,
         mercadolibre_affiliate_required: bool = True,
+        amazon_affiliate_required: bool = True,
+        amazon_min_discount_percent: float = 50.0,
+        amazon_extreme_discount_threshold: float = 90.0,
+        amazon_min_absolute_price: float = 10.0,
     ) -> None:
         """
         Args:
@@ -84,11 +109,19 @@ class WhatsAppPublisher:
             enabled: si False, el publisher salta todo y devuelve `skipped=True`.
             mercadolibre_affiliate_required: si True, los items ML SIN
                 `affiliate_url` no se publican.
+            amazon_affiliate_required: si True, los items Amazon SIN
+                `affiliate_url` válido (amzn.to/ o tag=) no se publican.
+            amazon_min_discount_percent: descuento mínimo verificado para
+                publicar una oferta normal de Amazon.
         """
         self.client = client
         self.target_group_id = target_group_id or ""
         self.enabled = enabled
         self.mercadolibre_affiliate_required = mercadolibre_affiliate_required
+        self.amazon_affiliate_required = amazon_affiliate_required
+        self.amazon_min_discount_percent = amazon_min_discount_percent
+        self.amazon_extreme_discount_threshold = amazon_extreme_discount_threshold
+        self.amazon_min_absolute_price = amazon_min_absolute_price
 
     async def publish(self, item: OutboxItem) -> PublishOutcome:
         """Publica el item correspondiente al outbox.
@@ -117,6 +150,11 @@ class WhatsAppPublisher:
                 evolution_response=None,
                 error="target_group_id_unset",
             )
+
+        # Gate Amazon: afiliado válido + precio anterior verificado.
+        amazon_gate = self._amazon_gate(item)
+        if amazon_gate is not None:
+            return amazon_gate
 
         # Gate ML: si es Mercado Libre y exige afiliado, validar.
         ml_gate_error = self._mercadolibre_affiliate_gate(item)
@@ -178,6 +216,91 @@ class WhatsAppPublisher:
     # ------------------------------------------------------------------
     # Gates específicos
     # ------------------------------------------------------------------
+
+    def _amazon_gate(self, item: OutboxItem) -> Optional[PublishOutcome]:
+        """Guardrail duro para Amazon.
+
+        - Exige `affiliate_url` válido (amzn.to/ o tag=) si está configurado.
+        - Para ofertas NORMAL (descuento) exige precio anterior verificado:
+          `old_price_verified` truthy, `previous_price > current_price`,
+          descuento declarado coherente con el calculado (tolerancia 2 pts),
+          y descuento >= mínimo configurado.
+        - Los price_error de Amazon no exigen precio anterior (no muestran
+          "Antes"), pero sí afiliado válido.
+
+        Devuelve un `PublishOutcome` con `discard_reason` cuando bloquea, o
+        `None` cuando el item puede continuar.
+        """
+        payload = item.message_payload or {}
+        if (payload.get("marketplace") or "").lower() != "amazon":
+            return None
+
+        # 1. Afiliado válido.
+        if self.amazon_affiliate_required:
+            if not _is_valid_affiliate_url(payload.get("affiliate_url")):
+                return self._amazon_block(item, "amazon_missing_affiliate")
+
+        # 2. Precio anterior verificado (solo ofertas de descuento).
+        if item.type == OutboxType.NORMAL.value:
+            if not payload.get("old_price_verified"):
+                return self._amazon_block(item, "amazon_no_verified_old_price")
+            try:
+                cur = float(payload.get("current_price"))
+                prev = float(payload.get("previous_price"))
+            except (TypeError, ValueError):
+                return self._amazon_block(item, "amazon_no_verified_old_price")
+            if prev <= cur:
+                return self._amazon_block(item, "amazon_no_verified_old_price")
+
+            # 2a. GUARDRAIL anti falso-positivo (precio por unidad / extremo).
+            #     Defensa en profundidad: aunque el extractor falle, aquí se
+            #     bloquea el típico "$0.69 / unidad" publicado como total.
+            raw_text = str(payload.get("current_price_raw_text") or "")
+            if _UNIT_PRICE_TEXT_RE.search(raw_text):
+                return self._amazon_block(item, "amazon_unit_price_as_current_price")
+
+            computed = round((prev - cur) / prev * 100)
+
+            # 2b. Descuento extremo: exige verificación explícita.
+            if computed >= self.amazon_extreme_discount_threshold:
+                if not payload.get("extreme_discount_verified"):
+                    return self._amazon_block(item, "amazon_extreme_discount_unverified")
+
+            # 2c. Precio absoluto sospechoso: muy bajo frente a un old_price alto
+            #     (patrón de precio por unidad tomado como total).
+            if cur < self.amazon_min_absolute_price and prev > 50:
+                if not payload.get("extreme_discount_verified"):
+                    return self._amazon_block(item, "amazon_current_price_suspicious")
+
+            # 2d. current_price < 1% del old_price → casi siempre unit price.
+            if prev > 0 and cur < (prev * 0.01):
+                if not payload.get("extreme_discount_verified"):
+                    return self._amazon_block(item, "amazon_current_price_suspicious")
+
+            declared = payload.get("discount_percent")
+            if declared is not None:
+                try:
+                    if abs(float(declared) - computed) > 2:
+                        return self._amazon_block(item, "amazon_discount_mismatch")
+                except (TypeError, ValueError):
+                    return self._amazon_block(item, "amazon_discount_mismatch")
+            if computed < self.amazon_min_discount_percent:
+                return self._amazon_block(item, "amazon_below_min_discount")
+
+        return None
+
+    def _amazon_block(self, item: OutboxItem, reason: str) -> PublishOutcome:
+        logger.warning(
+            "publish Amazon bloqueado (id=%s): %s", item.id, reason
+        )
+        return PublishOutcome(
+            success=False,
+            dry_run=self.client.dry_run,
+            formatted=None,
+            evolution_response=None,
+            error=reason,
+            discard_reason=reason,
+        )
 
     def _mercadolibre_affiliate_gate(self, item: OutboxItem) -> Optional[str]:
         payload = item.message_payload or {}
@@ -257,6 +380,14 @@ class WhatsAppPublisher:
         ):
             return item
         payload = item.message_payload or {}
+        # Para Amazon NUNCA degradamos a oferta normal derivando el precio
+        # anterior desde el descuento: una oferta normal Amazon exige
+        # `old_price_verified`. Si no lo tiene, no se degrada (y el
+        # `_amazon_gate` ya lo habrá bloqueado antes de llegar aquí).
+        if (payload.get("marketplace") or "").lower() == "amazon" and not payload.get(
+            "old_price_verified"
+        ):
+            return item
         confidence = (payload.get("confidence_label") or "").lower()
         if confidence in ("high", "very high"):
             return item
@@ -362,7 +493,38 @@ class WhatsAppPublisher:
         if item.type == OutboxType.NORMAL.value:
             previous_price = payload.get("previous_price")
             discount_percent = payload.get("discount_percent")
-            if previous_price is None or discount_percent is None:
+            marketplace = (payload.get("marketplace") or "").lower()
+            if discount_percent is None:
+                raise FormatterError(
+                    "normal offer requires discount_percent"
+                )
+            # Para Amazon NUNCA derivamos el precio anterior desde el
+            # descuento: exigimos un previous_price real y verificado (el
+            # gate de Amazon ya lo validó). Inventar "Antes" a partir del
+            # % es justamente el bug que estamos corrigiendo.
+            if marketplace == "amazon":
+                if not payload.get("old_price_verified"):
+                    raise FormatterError(
+                        "amazon offer requires verified previous_price"
+                    )
+                if previous_price is None:
+                    raise FormatterError(
+                        "amazon offer requires previous_price"
+                    )
+            else:
+                # ML/otros: si no hay previous_price pero sí discount_percent
+                # y current_price, lo derivamos matemáticamente. Esto cubre
+                # items de ML donde el precio anterior no siempre está en el
+                # DOM pero el descuento sí.
+                if previous_price is None and current_price is not None:
+                    try:
+                        disc_val = float(discount_percent)
+                        cur_val = float(current_price)
+                        if 0 < disc_val < 100 and cur_val > 0:
+                            previous_price = round(cur_val / (1 - disc_val / 100.0), 2)
+                    except (TypeError, ValueError):
+                        pass
+            if previous_price is None:
                 raise FormatterError(
                     "normal offer requires previous_price + discount_percent"
                 )

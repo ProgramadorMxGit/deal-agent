@@ -1,0 +1,2 @@
+"""Canales de notificación operativa."""
+

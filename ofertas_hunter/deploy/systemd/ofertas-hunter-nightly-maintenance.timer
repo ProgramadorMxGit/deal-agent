@@ -1,0 +1,17 @@
+[Unit]
+Description=Timer nocturno de mantenimiento de Ofertas Hunter
+Documentation=https://github.com/ (ver docs/NIGHTLY_MAINTENANCE.md)
+
+[Timer]
+# IMPORTANTE: el servidor está en UTC (timedatectl => Etc/UTC). La ventana de
+# mantenimiento del .env es 03:00-04:30 America/Mexico_City = 09:00-10:30 UTC.
+# Por eso OnCalendar dispara a las 09:10 UTC (≈ 03:10 hora MX). El CLI
+# revalida la ventana con NIGHTLY_MAINTENANCE_TIMEZONE, así que si el TZ del
+# server cambia, la salvaguarda real sigue siendo el chequeo del CLI.
+OnCalendar=*-*-* 09:10:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=ofertas-hunter-nightly-maintenance.service
+
+[Install]
+WantedBy=timers.target

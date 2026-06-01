@@ -87,6 +87,7 @@ class MercadoLibreHunterAgent:
         save_cookies_on_exit: bool = True,
         affiliate_extractor: Optional[AffiliateExtractor] = None,
         affiliate_required_for_publish: bool = True,
+        session_manager: Any = None,
     ) -> None:
         self.browser = browser
         self.session = session
@@ -97,6 +98,7 @@ class MercadoLibreHunterAgent:
         self.save_cookies_on_exit = save_cookies_on_exit
         self.affiliate_extractor = affiliate_extractor
         self.affiliate_required_for_publish = affiliate_required_for_publish
+        self.session_manager = session_manager
         self._paused = False
 
     async def aclose(self) -> None:
@@ -109,6 +111,27 @@ class MercadoLibreHunterAgent:
     def paused(self) -> bool:
         return self._paused
 
+    def _session_manager_blocks(self) -> Optional[str]:
+        """Devuelve el estado del manager si NO es VALID; si no hay manager
+        o el estado es VALID, devuelve None.
+        """
+        manager = self.session_manager
+        if manager is None:
+            return None
+        try:
+            status = getattr(manager, "status", None)
+            if status is None:
+                return None
+            value = getattr(status, "value", None) or str(status)
+            if value == "valid":
+                return None
+            return value
+        except Exception:
+            return None
+
+    # Throttle: emitir el evento de skip máximo 1 vez por minuto
+    _last_skip_event_ts: float = 0.0
+
     # ------------------------------------------------------------------
     # Entry points
     # ------------------------------------------------------------------
@@ -116,6 +139,22 @@ class MercadoLibreHunterAgent:
     async def hunt_urls(
         self, urls: list[str], *, max_urls: Optional[int] = None
     ) -> list[MlHuntOutcome]:
+        # Gate: si hay session_manager y está en estado != VALID,
+        # saltamos el ciclo entero. Amazon y Telegram NO se ven
+        # afectados (corren en otros agentes).
+        manager_state = self._session_manager_blocks()
+        if manager_state is not None:
+            import time as _time
+            now_ts = _time.monotonic()
+            if now_ts - self._last_skip_event_ts >= 60.0:
+                self._last_skip_event_ts = now_ts
+                self._emit_runtime_event(
+                    kind="ml_hunt_skipped_session_invalid",
+                    severity="warning",
+                    payload={"manager_state": manager_state, "urls": len(urls)},
+                )
+            return []
+
         target = urls[: max_urls] if max_urls else urls
         outcomes: list[MlHuntOutcome] = []
         for url in target:
@@ -131,6 +170,13 @@ class MercadoLibreHunterAgent:
                     severity="critical",
                     payload={"url": url, "final_url": outcome.final_url},
                 )
+                # Notificar al manager que la sesión está inválida.
+                manager = self.session_manager
+                if manager is not None and hasattr(manager, "mark_invalid"):
+                    try:
+                        manager.mark_invalid("login_redirect_during_hunt")
+                    except Exception:
+                        logger.exception("session_manager.mark_invalid falló")
                 break
         return outcomes
 
@@ -138,6 +184,20 @@ class MercadoLibreHunterAgent:
         """Toma URLs `kind=product` del frontier ML."""
         if self.db is None or self._paused:
             return []
+        # Gate por estado del manager (mismo criterio que hunt_urls).
+        manager_state = self._session_manager_blocks()
+        if manager_state is not None:
+            import time as _time
+            now_ts = _time.monotonic()
+            if now_ts - self._last_skip_event_ts >= 60.0:
+                self._last_skip_event_ts = now_ts
+                self._emit_runtime_event(
+                    kind="ml_hunt_skipped_session_invalid",
+                    severity="warning",
+                    payload={"manager_state": manager_state, "from_frontier": True},
+                )
+            return []
+
         from ..exploration.frontier import FrontierRepo
 
         frontier = FrontierRepo(self.db)
@@ -502,6 +562,8 @@ class MercadoLibreHunterAgent:
             "affiliate_product_id": affiliate_product_id,
             "commission_text": commission_text,
             "marketplace": product.marketplace,
+            "brand": product.brand_guess,
+            "category": product.category_guess,
             "item_id": product.asin,
             "confidence_label": scoring.confidence_label,
             "score": scoring.score,

@@ -1,7 +1,7 @@
 """Smoke test in-process del MCP server.
 
-Construye un `MCPServer` con context real (DB temporal) y dispara las 16
-tools (5 read + 7 action + 4 quality) verificando que cada una devuelva una
+Construye un `MCPServer` con context real (DB temporal) y dispara las 17
+tools (5 read + 8 action + 4 quality) verificando que cada una devuelva una
 respuesta del shape esperado. Las action tools que requieren browser real
 son mockeadas con fakes.
 """
@@ -31,11 +31,13 @@ CANONICAL_TOOLS = (
     "get_outbox",
     "get_recent_events",
     "get_frontier_stats",
-    # action (7)
+    # action (9)
     "discover_seeds",
     "hunt_amazon",
     "hunt_mercadolibre",
+    "process_telegram",
     "dispatch_outbox",
+    "enrich_amazon_affiliates",
     "revalidate_offer",
     "pause_marketplace",
     "unpause_marketplace",
@@ -216,7 +218,7 @@ def _seed_outbox(db: sqlite3.Connection, payload: dict | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_handshake_announces_16_canonical_tools(server) -> None:
+def test_handshake_announces_canonical_tools(server) -> None:
     names = set(server.registry.keys())
     expected = set(CANONICAL_TOOLS)
     assert names == expected, f"diff: {expected.symmetric_difference(names)}"
@@ -261,6 +263,11 @@ async def test_dispatch_each_action_tool_returns_shape(server, db) -> None:
     assert out.get("success") is True or out.get("skipped") is True
 
     out = await server.dispatch("hunt_mercadolibre", {"limit": 2})
+    assert out.get("success") is True or out.get("skipped") is True
+
+    # process_telegram
+    server.ctx.settings.telegram_enabled = False
+    out = await server.dispatch("process_telegram", {"limit": 2, "budget": 2})
     assert out.get("success") is True or out.get("skipped") is True
 
     # dispatch_outbox

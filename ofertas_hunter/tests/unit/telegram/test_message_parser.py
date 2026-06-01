@@ -56,6 +56,50 @@ class TestMessageParser:
         parsed = parse_message(text, channel="x", message_id=4, captured_at=_now())
         assert parsed.skip_reason == "no_link"
 
+    def test_amazon_de_x_a_y_uses_final_price(self):
+        text = (
+            "Samsung Galaxy S25 Ultra Azul 256GB con S-Pen\n"
+            "‼️50% DE DESCUENTO‼️\n"
+            "DE $32,999.00 A $11,499.00 🔥🔥🔥🔥\n"
+            "✅ Cupón: BNMXHOT30\n"
+            "https://amzn.to/43HYadf\n"
+            "👉Compra mínima $12,500 mxn\n"
+            "▶️Max descuento $5,000 mxn"
+        )
+        parsed = parse_message(text, channel="ofertas", message_id=5, captured_at=_now())
+        assert parsed.marketplace == "amazon"
+        assert parsed.discount_visible == 50.0
+        assert parsed.written_price == 11499.0
+
+    def test_amazon_precio_oferta_mas_cupon_prefers_coupon_price(self):
+        text = (
+            "Amazon: Samsung Galaxy Tab S10+ Plata 12GB RAM 256GB, AI, S Pen, 1 año con Garantía\n"
+            "👉Enlace:\n"
+            "https://www.amazon.com.mx/dp/B0DF1FBWMF\n"
+            "🔥Precio Oferta + ✅Cupón Bancario: $12,499.00\n"
+            "🔥Precio Oferta: $12,999.00\n"
+            "▶️Cupones de 10% ó 15% ó 20%\n"
+            "✅AMAZON ACCESS INVEX:\n"
+            "Cupón de $200: ACCESSHOT150"
+        )
+        parsed = parse_message(text, channel="ofertas", message_id=6, captured_at=_now())
+        assert parsed.marketplace == "amazon"
+        assert parsed.written_price == 12499.0
+
+    def test_amazon_ignores_min_purchase_and_cap_amounts_as_main_price(self):
+        text = (
+            "Amazon:Midea Refrigerador Side by Side, 20 pies, Glass Door Black, MDRS710FGM22\n"
+            "👉Enlace:\n"
+            "https://www.amazon.com.mx/dp/B0GSBXM7TW\n"
+            "✅Cupón de 30% pagando de contado o a Meses sin intereses con Tarjeta de crédito BANAMEX:\n"
+            "BNMXHOT30\n"
+            "➡️Compra mínima $12,500, ▶️Tope de descuento $5,000\n"
+            "🔥Precio Oferta + ✅Cupón 30% \"BNMXHOT30\": $10,188.66"
+        )
+        parsed = parse_message(text, channel="ofertas", message_id=7, captured_at=_now())
+        assert parsed.marketplace == "amazon"
+        assert parsed.written_price == 10188.66
+
 
 class TestUrgencyExtractor:
     def test_telegram_urgency_terms_increase_score(self):

@@ -1,0 +1,21 @@
+[Unit]
+Description=ofertas_hunter — saneamiento oneshot (housekeeping del outbox)
+
+[Service]
+Type=oneshot
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_ROOT__
+EnvironmentFile=__PROJECT_ROOT__/.env
+
+ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter saneamiento --apply --task all
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofertas-hunter-saneamiento
+

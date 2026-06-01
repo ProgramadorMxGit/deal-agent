@@ -1,29 +1,30 @@
 [Unit]
-Description=ofertas_hunter — orchestrator (hunters + price_intelligence)
+Description=Ofertas Hunter Orchestrator (Amazon + ML + Telegram + Dispatch)
 After=network-online.target
 Wants=network-online.target
-
-[Service]
-Type=simple
-User=__SERVICE_USER__
-WorkingDirectory=__PROJECT_ROOT__
-EnvironmentFile=__PROJECT_ROOT__/.env
-
-ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter run
-
-Restart=on-failure
-RestartSec=15
+# Evita bucles de reinicio (estos van en [Unit] en systemd moderno).
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
-# Hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs __PROJECT_ROOT__/secrets
-
-# Logging via journald
+[Service]
+Type=simple
+User=agaetranahoy
+Group=agaetranahoy
+WorkingDirectory=/opt/deal-agent/ofertas_hunter
+# HOME explícito: Playwright resuelve el browser en
+# /home/agaetranahoy/.cache/ms-playwright (igual que en tmux). Sin esto y/o
+# con ProtectHome, systemd no encuentra Chromium → watchdog/heartbeat stale.
+Environment=HOME=/home/agaetranahoy
+Environment=PYTHONUNBUFFERED=1
+# Carga el .env del proyecto (publishing, gates, ML throttle, nightly, etc.).
+EnvironmentFile=-/opt/deal-agent/ofertas_hunter/.env
+# Mismo proceso EXACTO que start.sh [3] -> [f] (orquestador_ia.py).
+ExecStart=/opt/deal-agent/ofertas_hunter/.venv/bin/python /opt/deal-agent/ofertas_hunter/scripts/orquestador_ia.py
+Restart=on-failure
+RestartSec=10
+# Apagado limpio: el orquestador captura SIGINT y cierra browsers/contextos.
+KillSignal=SIGINT
+TimeoutStopSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ofertas-hunter

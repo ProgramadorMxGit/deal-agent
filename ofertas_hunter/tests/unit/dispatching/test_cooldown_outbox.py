@@ -112,6 +112,28 @@ class TestInMemoryOutbox:
         assert len(needs) == 1
         assert needs[0].offer_id == 1
 
+    def test_outbox_revalidates_telegram_items_immediately(self):
+        outbox = InMemoryOutbox(OutboxConfig(revalidate_age_seconds=3600))
+        item = _item(OutboxType.NORMAL.value, offer_id=1)
+        item.message_payload["requires_live_validation"] = True
+        item.message_payload["source"] = "telegram"
+        outbox.enqueue(item)
+
+        needs = outbox.needs_revalidation(now=_now())
+
+        assert len(needs) == 1
+        assert needs[0].offer_id == 1
+
+    def test_outbox_does_not_pick_items_requiring_live_validation(self):
+        outbox = InMemoryOutbox()
+        item = _item(OutboxType.NORMAL.value, offer_id=1)
+        item.message_payload["requires_live_validation"] = True
+        outbox.enqueue(item)
+
+        chosen = outbox.pick_random_eligible(last_normal_publication_at=None, now=_now())
+
+        assert chosen is None
+
     def test_pick_random_eligible_prefers_price_error(self):
         outbox = InMemoryOutbox()
         for i in range(5):

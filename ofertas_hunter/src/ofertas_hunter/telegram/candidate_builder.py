@@ -6,7 +6,8 @@ Decisión de clasificación interna (independiente del scorer numérico):
 - `noise`: sin link válido, sin precio extraíble y sin señales de urgencia.
 - `telegram_price_error_signal`: tiene señales fuertes de error de precio
   (keyword "ERROR DE PRECIO" o urgencia alta).
-- `telegram_deal_signal`: parece oferta normal con descuento visible.
+- `telegram_deal_signal`: parece oferta normal con descuento visible o con
+  formato Amazon estructurado que requiere revalidación live.
 
 Para los candidatos no descartados, se llama al `PriceErrorScorer` y se
 construye opcionalmente un `OutboxItem` en estado `pending_revalidation`
@@ -16,6 +17,7 @@ construye opcionalmente un `OutboxItem` en estado `pending_revalidation`
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -135,7 +137,9 @@ class TelegramCandidateBuilder:
         # 3. Score del scorer >= confirmed/possible → PE.
         # 4. Score 40-59 (suspicious) → PE como possible_pe.
         # 5. Discount visible >= normal_offer_min_discount → DEAL.
-        # 6. Resto → noise.
+        # 6. Amazon con formato estructurado de cupón/precio final → DEAL
+        #    pendiente de revalidación live.
+        # 7. Resto → noise.
         score_label = scoring.classification
         is_strong_pe = (
             parsed.is_price_error_keyword
@@ -158,6 +162,9 @@ class TelegramCandidateBuilder:
             parsed.discount_visible is not None
             and parsed.discount_visible >= self.normal_offer_min_discount
         ):
+            internal = LISTENER_DEAL
+            outbox_type = OutboxType.NORMAL.value
+        elif self._is_amazon_structured_offer(parsed):
             internal = LISTENER_DEAL
             outbox_type = OutboxType.NORMAL.value
         else:
@@ -228,6 +235,20 @@ class TelegramCandidateBuilder:
         no_urgency = parsed.urgency_score == 0 and not parsed.is_price_error_keyword
         no_discount = parsed.discount_visible is None
         return no_link and no_price and no_urgency and no_discount
+
+    def _is_amazon_structured_offer(self, parsed: ParsedTelegramMessage) -> bool:
+        if parsed.marketplace != "amazon":
+            return False
+        if parsed.written_price is None or not parsed.original_url:
+            return False
+
+        text = parsed.text.lower()
+        return (
+            "precio oferta +" in text
+            or "precio oferta:" in text
+            or re.search(r"\bde\s*\$?\s*[0-9][0-9\.,]*\s*a\s*\$?\s*[0-9][0-9\.,]*\b", text)
+            is not None
+        )
 
     def _can_enqueue_pending(
         self,

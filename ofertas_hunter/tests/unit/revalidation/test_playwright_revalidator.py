@@ -79,6 +79,8 @@ def _outbox_item_from_telegram(url: str, *, hours_ago: float = 0.5) -> OutboxIte
             "source_channel": "OFERTAS_RELAMPAGO",
             "original_url": url,
             "resolved_url": url,
+            # Los links de Telegram (p.ej. Ofertones) ya traen tag de afiliado.
+            "affiliate_url": f"{url}?tag=ofertones03-20",
             "urgency_terms": ["ERROR DE PRECIO", "CORRAN"],
             "requires_live_validation": True,
         },
@@ -175,8 +177,9 @@ async def test_revalidator_confirms_normal_offer_cooldown():
     detail = await revalidator.revalidate_detailed(item)
     assert detail.ok is True
     assert detail.suggested_outbox_type == OutboxType.NORMAL.value
-    # Discount real ≈ 57% → normal
-    assert detail.extracted.discount_percent in (57, 57.0, 57.51)
+    # Discount real ≈ 57% → normal (1 - 388/899 = 56.84%)
+    assert detail.extracted.discount_percent is not None
+    assert 56.0 <= detail.extracted.discount_percent <= 58.0
 
 
 @pytest.mark.asyncio
@@ -205,6 +208,11 @@ async def test_revalidator_revalidates_items_older_than_one_hour():
             "url": url,
             "image_url": "https://m.media-amazon.com/cached.jpg",
             "marketplace": "amazon",
+            "affiliate_url": "https://amzn.to/4e3yTjG",
+            "old_price_verified": True,
+            # Fuerza el camino de revalidación (excluye del fast-path fresh):
+            # los items que exigen validación en vivo pasan por el revalidator.
+            "requires_live_validation": True,
         },
         enqueued_at=T0 - timedelta(hours=2),
     )

@@ -301,6 +301,8 @@ async def test_ml_outbox_payload_contains_affiliate_url(tmp_path):
     assert payload["affiliate_url"] == "https://meli.la/abc123"
     assert payload["affiliate_product_id"] == "FAKE-12345"
     assert payload["commission_text"] == "COMISIÓN 9%"
+    assert payload["brand"]
+    assert "category" in payload
     # canonical_url se preserva para scraping (ahora incluye el slug)
     assert payload["canonical_url"] == "https://articulo.mercadolibre.com.mx/MLM98765432-sony"
     # url (publicación) usa affiliate_url
@@ -419,3 +421,84 @@ async def test_ml_no_share_button_skips_affiliate_extraction(tmp_path):
     assert info.success is False
     assert info.error == "no_share_button"
     assert extractor.calls == []  # nunca se llamó
+
+
+# ---------------------------------------------------------------------------
+# Gate: session_manager
+# ---------------------------------------------------------------------------
+
+
+class _StubManagerInvalid:
+    """Stub mínimo que reporta status != VALID."""
+
+    class _Status:
+        value = "invalid"
+
+    status = _Status()
+
+    def mark_invalid(self, reason):  # pragma: no cover
+        pass
+
+
+class _StubManagerValid:
+    class _Status:
+        value = "valid"
+
+    status = _Status()
+
+    def mark_invalid(self, reason):  # pragma: no cover
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ml_hunter_skips_when_session_manager_not_valid(tmp_path):
+    """Test obligatorio E (parte ML): si el session_manager reporta
+    cualquier estado != VALID, el hunter ML debe saltar el ciclo (sin
+    afectar otros marketplaces). El bot main no debería llamarlo, pero
+    si lo hace, queremos no-op + runtime_event.
+    """
+    db_path = tmp_path / "skip.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    url = "https://articulo.mercadolibre.com.mx/MLM-skip"
+    browser = FakeBrowserWorker({})
+    agent = MercadoLibreHunterAgent(
+        browser=browser,
+        db_conn=conn,
+        session_manager=_StubManagerInvalid(),
+    )
+
+    outcomes = await agent.hunt_urls([url])
+    assert outcomes == []  # no se procesa ninguna URL
+
+    # Debe haber runtime_event "ml_hunt_skipped_session_invalid"
+    rows = conn.execute(
+        "SELECT 1 FROM runtime_events WHERE kind = 'ml_hunt_skipped_session_invalid'"
+    ).fetchall()
+    assert len(rows) == 1
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ml_hunter_runs_when_session_manager_is_valid(tmp_path):
+    """Si el manager está VALID, el hunter procede normal."""
+    db_path = tmp_path / "ok.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    url = "https://articulo.mercadolibre.com.mx/MLM98765432-sony"
+    browser = FakeBrowserWorker(
+        {url: _ok(_load("extreme_discount_60_percent.html"), url)}
+    )
+    agent = MercadoLibreHunterAgent(
+        browser=browser,
+        db_conn=conn,
+        affiliate_extractor=FakeAffiliateExtractor(),
+        session_manager=_StubManagerValid(),
+    )
+
+    outcomes = await agent.hunt_urls([url])
+    assert len(outcomes) == 1
+    assert outcomes[0].extracted is not None
+    conn.close()

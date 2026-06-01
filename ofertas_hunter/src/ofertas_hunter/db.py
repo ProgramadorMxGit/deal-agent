@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 from .config import PROJECT_ROOT, get_settings
 
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
+T = TypeVar("T")
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -45,6 +47,52 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn)
     return conn
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def run_with_retry(
+    operation: Callable[[], T],
+    *,
+    description: str,
+    retries: int = 5,
+    base_delay_seconds: float = 0.05,
+) -> T:
+    attempt = 0
+    while True:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc) or attempt >= retries:
+                raise
+            delay = base_delay_seconds * (2**attempt)
+            logger.warning(
+                "%s hit SQLite lock; retrying attempt=%s/%s sleep=%.2fs",
+                description,
+                attempt + 1,
+                retries,
+                delay,
+            )
+            time.sleep(delay)
+            attempt += 1
+
+
+def execute_with_retry(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: tuple | list = (),
+    *,
+    description: str,
+):
+    return run_with_retry(
+        lambda: conn.execute(sql, params),
+        description=description,
+    )
 
 
 @contextmanager

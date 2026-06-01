@@ -8,7 +8,7 @@ Endpoints usados:
 Headers obligatorios:
 
 - `Content-Type: application/json`
-- `apikey: <EVOLUTION_API_KEY>`
+- `<EVOLUTION_API_KEY_HEADER>: <EVOLUTION_API_KEY>`
 
 Modos de operación:
 
@@ -54,6 +54,7 @@ class EvolutionResponse:
     raw: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     dry_run: bool = False
+    temporary: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,25 @@ class EvolutionConfigError(RuntimeError):
 
 
 _DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$")
+_CONNECTION_CLOSED_RE = re.compile(r"connection\s+closed", re.IGNORECASE)
+
+
+def _flatten_error_text(data: Any) -> str:
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        return " ".join(_flatten_error_text(part) for part in data)
+    if isinstance(data, dict):
+        return " ".join(_flatten_error_text(value) for value in data.values())
+    return str(data)
+
+
+def _classify_response_error(
+    status_code: int, data: dict[str, Any]
+) -> tuple[str, bool]:
+    if _CONNECTION_CLOSED_RE.search(_flatten_error_text(data)):
+        return "connection_closed", True
+    return f"http_status_{status_code}", False
 
 
 def _resolve_media_payload(media: str | bytes | Path) -> tuple[str, str]:
@@ -140,6 +160,7 @@ class EvolutionClient:
         api_key: Optional[str],
         instance: Optional[str],
         *,
+        api_key_header: str = "apikey",
         dry_run: bool = True,
         timeout_seconds: float = 25.0,
         media_timeout_seconds: float = 40.0,
@@ -148,6 +169,7 @@ class EvolutionClient:
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.instance = instance or ""
+        self.api_key_header = (api_key_header or "apikey").strip() or "apikey"
         self.dry_run = dry_run
         self.timeout_seconds = timeout_seconds
         self.media_timeout_seconds = media_timeout_seconds
@@ -196,7 +218,7 @@ class EvolutionClient:
     def _headers(self) -> dict[str, str]:
         return {
             "Content-Type": "application/json",
-            "apikey": self.api_key,
+            self.api_key_header: self.api_key,
         }
 
     # ------------------------------------------------------------------
@@ -221,6 +243,15 @@ class EvolutionClient:
             return EvolutionResponse(success=True, dry_run=True, raw={"payload": payload})
 
         return await self._post("/message/sendText", payload, self.timeout_seconds)
+
+    async def send_image(
+        self,
+        number: str,
+        image_url: str,
+        caption: str = "",
+    ) -> EvolutionResponse:
+        """Alias explícito para el contrato de imagen documentado."""
+        return await self.send_media(number, image_url, caption=caption)
 
     async def send_media(
         self,
@@ -274,6 +305,18 @@ class EvolutionClient:
 
         return await self._post("/message/sendMedia", payload, self.media_timeout_seconds)
 
+    async def connection_state(self) -> str:
+        """Consulta el estado de la instancia Evolution (`open`, etc.)."""
+        if self.dry_run:
+            return "dry_run"
+        data = await self._get("/instance/connectionState", timeout=self.timeout_seconds)
+        instance_data = data.get("instance")
+        if isinstance(instance_data, dict):
+            state = instance_data.get("state")
+            if isinstance(state, str):
+                return state
+        raise RuntimeError("connection_state_missing")
+
     # ------------------------------------------------------------------
     # Helpers HTTP
     # ------------------------------------------------------------------
@@ -292,7 +335,11 @@ class EvolutionClient:
             )
         except httpx.HTTPError as exc:
             logger.warning("Evolution %s failed: %s", endpoint, exc)
-            return EvolutionResponse(success=False, error=f"http_error: {exc}")
+            return EvolutionResponse(
+                success=False,
+                error=f"http_error: {exc}",
+                temporary=True,
+            )
 
         try:
             data = resp.json()
@@ -301,16 +348,33 @@ class EvolutionClient:
 
         success = resp.status_code in (200, 201)
         if not success:
+            error, temporary = _classify_response_error(resp.status_code, data)
             logger.warning(
                 "Evolution %s status=%d body=%s",
                 endpoint,
                 resp.status_code,
                 str(data)[:300],
             )
+        else:
+            error, temporary = None, False
 
         return EvolutionResponse(
             success=success,
             status_code=resp.status_code,
             raw=data if isinstance(data, dict) else {"data": data},
-            error=None if success else f"http_status_{resp.status_code}",
+            error=error,
+            temporary=temporary,
         )
+
+    async def _get(self, endpoint: str, *, timeout: float) -> dict[str, Any]:
+        self._ensure_configured()
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=timeout)
+
+        url = f"{self.base_url}{endpoint}/{self.instance}"
+        resp = await self._client.get(url, headers=self._headers(), timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            return data
+        raise RuntimeError("invalid_json_response")

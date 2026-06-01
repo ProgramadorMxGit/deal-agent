@@ -1,0 +1,23 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0CAPLOW",
+  "final_url": "https://www.amazon.com.mx/dp/B0CAPLOW",
+  "status": 200,
+  "duration_ms": null,
+  "blocked": false,
+  "error": null,
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "low",
+    "strong_signals": [],
+    "weak_signals": [
+      "validateCaptcha",
+      "amzn-captcha"
+    ],
+    "visible_signals": [],
+    "should_pause_marketplace": false,
+    "reasons": [
+      "weak_token_only_no_structure"
+    ]
+  },
+  "captured_at": "2026-05-29T22:06:28.813Z"
+}

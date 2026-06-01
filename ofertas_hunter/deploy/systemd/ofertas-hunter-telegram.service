@@ -2,25 +2,27 @@
 Description=ofertas_hunter — Telegram listener (Telethon)
 After=network-online.target
 Wants=network-online.target
+Conflicts=ofertas-hunter.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=__SERVICE_USER__
 WorkingDirectory=__PROJECT_ROOT__
 EnvironmentFile=__PROJECT_ROOT__/.env
+Environment=PLAYWRIGHT_BROWSERS_PATH=__PROJECT_ROOT__/.cache/ms-playwright
 
 ExecStart=__PROJECT_ROOT__/.venv/bin/python -m ofertas_hunter telegram-listen
 
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs __PROJECT_ROOT__/secrets
+ReadWritePaths=__PROJECT_ROOT__/data __PROJECT_ROOT__/logs __PROJECT_ROOT__/secrets __PROJECT_ROOT__/.cache
 
 StandardOutput=journal
 StandardError=journal

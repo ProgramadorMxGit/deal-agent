@@ -1,14 +1,14 @@
 {
   "mcpServers": {
     "ofertas-hunter": {
-      "command": "C:\\Users\\yarteaga\\Desktop\\bot_autonomo_ofert\\ofertas_hunter\\.venv\\Scripts\\python.exe",
+      "command": "/opt/deal-agent/ofertas_hunter/.venv/bin/python",
       "args": [
         "-m",
         "ofertas_hunter",
         "mcp-serve",
         "--no-lock"
       ],
-      "cwd": "C:\\Users\\yarteaga\\Desktop\\bot_autonomo_ofert\\ofertas_hunter",
+      "cwd": "/opt/deal-agent/ofertas_hunter",
       "env": {
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUNBUFFERED": "1"

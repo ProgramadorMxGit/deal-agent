@@ -132,6 +132,36 @@ def test_telegram_no_image_no_outbox_item_safe():
     assert "no_image" in candidate.scoring.not_publishable_reasons
 
 
+def test_amazon_coupon_format_without_visible_50_still_enqueues_for_live_validation():
+    text = (
+        "Amazon: Samsung Galaxy S25 Ultra Azul 256GB con S-Pen\n"
+        "👉Ver Oferta:\n"
+        "https://www.amazon.com.mx/dp/B0DNTX93TX\n"
+        "✅Cupón de 30% pagando de contado o a Meses sin intereses con Tarjeta de crédito BANAMEX:\n"
+        "BNMXHOT30\n"
+        "➡️Compra mínima $12,500, ▶️Tope de descuento $5,000\n"
+        "🔥Precio Oferta + ✅Cupón 30% \"BNMXHOT30\": $11,549"
+    )
+    parsed = parse_message(
+        text,
+        channel="ofertonesmexico",
+        message_id=2,
+        captured_at=_now(),
+        image_path="/fake/img.jpg",
+        chat_id=-100123,
+    )
+
+    candidate = TelegramCandidateBuilder().build(parsed)
+
+    assert parsed.marketplace == "amazon"
+    assert parsed.discount_visible == 30.0
+    assert parsed.written_price == 11549.0
+    assert candidate.internal_classification == LISTENER_DEAL
+    assert candidate.outbox_item is not None
+    assert candidate.outbox_item.message_payload["current_price"] == 11549.0
+    assert candidate.outbox_item.message_payload["requires_live_validation"] is True
+
+
 
 # ---------------------------------------------------------------------------
 # Test obligatorio: links ML desde Telegram NO generan affiliate

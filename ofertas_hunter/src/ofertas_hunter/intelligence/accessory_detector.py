@@ -78,6 +78,31 @@ _ACCESSORY_TOKENS: tuple[str, ...] = (
     "splitter",
     "cabeza única",
     "cabeza unica",
+    # Audio accesorios (NO son smartphones aunque mencionen marcas como
+    # "Redmi Buds", "Galaxy Buds", "JBL Flip", etc.). Esto evita que el
+    # scorer los promueva con `smartphone_below_500_extreme`.
+    "audífonos",
+    "audifonos",
+    "auriculares",
+    "earbuds",
+    "earphones",
+    "headphones",
+    "headset",
+    "audífono",
+    "audifono",
+    "bocina",
+    "bocinas",
+    "altavoz",
+    "altavoces",
+    "speaker",
+    "buds",  # Redmi Buds, Galaxy Buds, Pixel Buds, AirPods Buds
+    "smartwatch",
+    "smart watch",
+    "smartband",
+    "smart band",
+    "pulsera inteligente",
+    "reloj inteligente",
+    "fitness band",
 )
 
 
@@ -249,6 +274,41 @@ def assess_title(
 
     cat_norm = (category or "").lower().strip()
     is_accessory = bool(primary_hits) or cat_norm in _ACCESSORY_CATEGORIES
+
+    # Excepción: productos audio premium reales (Sony WF-1000XM5,
+    # AirPods Pro/Max, QuietComfort Ultra/45, Sennheiser Momentum) son
+    # legítimamente "audífonos" en el título, pero NO son accesorios
+    # genéricos. Si matchean patrón premium real, anulamos el flag de
+    # accesorio para que conserven los bonus de error de precio.
+    _PREMIUM_AUDIO_PATTERNS = (
+        re.compile(r"\bsony\s+wf-?1000xm\d", re.IGNORECASE),
+        re.compile(r"\bsony\s+wh-?1000xm\d", re.IGNORECASE),
+        re.compile(r"\bairpods\s+(pro|max)", re.IGNORECASE),
+        re.compile(r"\bquietcomfort\s+(ultra|45|earbuds)", re.IGNORECASE),
+        re.compile(r"\bbose\s+qc\s*(ultra|45)", re.IGNORECASE),
+        re.compile(r"\bsennheiser\s+momentum", re.IGNORECASE),
+    )
+    if is_accessory and any(p.search(title) for p in _PREMIUM_AUDIO_PATTERNS):
+        # El título describe un producto premium audio reconocido.
+        # Ej: "Audífonos Sony WF-1000XM5" - "audífonos" hace match pero
+        # el modelo Sony WF-1000XM5 es flagship real.
+        is_accessory = False
+        # Removemos el match audio del set para no contaminar reasons.
+        _AUDIO_TOKENS_TO_REMOVE = {
+            "audífonos", "audifonos", "auriculares", "earbuds",
+            "earphones", "headphones", "headset", "audífono",
+            "audifono", "buds",
+        }
+        primary_hits = [
+            h for h in primary_hits if h not in _AUDIO_TOKENS_TO_REMOVE
+        ]
+        matched = [
+            m for m in matched if m not in _AUDIO_TOKENS_TO_REMOVE
+        ]
+        # Si tras quitar tokens audio queda algún token de accesorio
+        # (cable, cargador, funda, etc.), reactivamos el flag.
+        if primary_hits:
+            is_accessory = True
 
     # Categoría sugerida.
     category_guess: Optional[str] = None

@@ -1,0 +1,52 @@
+{
+  "_version": 1,
+  "_last_healed": null,
+  "_heal_count": 0,
+  "_notes": "Selectores CSS para Amazon.com.mx — auto-actualizados por DomHealer",
+
+  "search_results": {
+    "product_container": "[data-component-type='s-search-result']",
+    "product_title": "h2.a-size-base-plus span, h2 a span, .a-size-medium.a-color-base.a-text-normal",
+    "product_link": "h2 a.a-link-normal, a.a-link-normal.s-line-clamp-4",
+    "price_current": ".a-price:not(.a-text-price) .a-offscreen",
+    "price_original": ".a-price.a-text-price .a-offscreen, [data-a-strike='true'] .a-offscreen",
+    "discount_badge": "[class*='discountText'], [class*='discount'], .a-badge-text, .s-coupon-highlight-color",
+    "rating": ".a-size-small.a-color-base:not(.a-text-normal), span[aria-label*='estrellas']",
+    "reviews_count": ".a-size-base.s-underline-text, [aria-label*='calificaciones']",
+    "prime_badge": ".s-prime, [aria-label='Amazon Prime'], .aok-relative .s-prime",
+    "image": ".s-image",
+    "next_page": ".s-pagination-next, a[aria-label='Ir a la página siguiente'], .a-pagination .a-last a"
+  },
+
+  "product_page": {
+    "title": "#productTitle, #title span",
+    "price_current": "#priceblock_ourprice, #priceblock_dealprice, .a-price .a-offscreen, #apex_offerDisplay_desktop .a-price .a-offscreen, #corePrice_desktop .a-price .a-offscreen",
+    "price_original": "#priceblock_was_price .a-offscreen, .basisPrice .a-offscreen, #apex_offerDisplay_desktop .basisPrice .a-offscreen, #corePrice_desktop .basisPrice .a-offscreen",
+    "discount_badge": "#savingsPercentage, .savingsPercentage, #dealprice_savings .a-color-price, .reinventPriceSavingsPercentageMargin",
+    "deal_badge": "#dealBadge, .dealBadge, #deal-badge, [id*='deal'] .a-badge-text",
+    "coupon": "#couponBadgeRegularVpc, .couponBadge, #vpcButton",
+    "availability": "#availability span, #outOfStock",
+    "asin": "[data-asin]",
+    "rating": "#acrPopover .a-icon-alt",
+    "reviews": "#acrCustomerReviewText",
+    "category_breadcrumb": "#wayfinding-breadcrumbs_feature_div a",
+    "add_to_cart": "#add-to-cart-button",
+    "buy_now": "#buy-now-button"
+  },
+
+  "deals_page": {
+    "deal_container": "[data-testid='deal-card'], .DealCard, .octopus-dlp-asin-image-wrapper",
+    "deal_title": "[data-testid='deal-card-title'], .DealCard-module__title",
+    "deal_discount": "[data-testid='deal-card-discount'], .DealCard-module__discountTag",
+    "deal_price": "[data-testid='deal-card-price'], .DealCard-module__price",
+    "deal_link": "a[href*='/dp/']",
+    "deal_image": "img[src*='images/I']"
+  },
+
+  "goldbox": {
+    "deal_item": ".a-section.octopus-dlp-asin-image-wrapper, [data-testid='deal-card']",
+    "discount_text": ".a-badge-text, .octopus-pc-percentage-off",
+    "price": ".a-price .a-offscreen",
+    "title": ".a-truncate-full, .a-size-base-plus"
+  }
+}

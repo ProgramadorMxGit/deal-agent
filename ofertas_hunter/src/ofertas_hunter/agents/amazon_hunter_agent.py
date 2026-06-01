@@ -31,6 +31,10 @@ from typing import Optional
 from ..browser.browser_context import BrowserWorker, RenderedPage
 from ..extraction.amazon_product_parser import AmazonProductParser
 from ..intelligence.price_error_scorer import PriceErrorScorer
+from ..marketplaces.amazon_affiliate import (
+    AffiliateExtractor,
+    AffiliateInfo,
+)
 from ..marketplaces.base import ExtractedProduct
 from ..models import (
     Classification,
@@ -68,6 +72,10 @@ class HuntOutcome:
     captcha_visible_signals: tuple[str, ...] = field(default_factory=tuple)
     captcha_weak_signals: tuple[str, ...] = field(default_factory=tuple)
     captcha_debug_path: Optional[str] = None
+    affiliate_url: Optional[str] = None
+    affiliate_store_id: Optional[str] = None
+    affiliate_tracking_id: Optional[str] = None
+    affiliate_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +94,14 @@ class AmazonHunterAgent:
         parser: Optional[AmazonProductParser] = None,
         scorer: Optional[PriceErrorScorer] = None,
         normal_offer_min_discount: float = 50.0,
+        affiliate_extractor: Optional[AffiliateExtractor] = None,
     ) -> None:
         self.browser = browser
         self.db = db_conn
         self.parser = parser or AmazonProductParser()
         self.scorer = scorer or PriceErrorScorer()
         self.normal_offer_min_discount = normal_offer_min_discount
+        self.affiliate_extractor = affiliate_extractor
 
     async def aclose(self) -> None:
         try:
@@ -289,8 +299,15 @@ class AmazonHunterAgent:
                 discarded_reason="discount_below_threshold",
             )
 
+        affiliate = await self._maybe_extract_affiliate(product)
         offer_id = self._upsert_offer(product_id, scoring)
-        outbox_id = self._enqueue_outbox(offer_id, product, scoring, outbox_type)
+        outbox_id = self._enqueue_outbox(
+            offer_id,
+            product,
+            scoring,
+            outbox_type,
+            affiliate=affiliate,
+        )
         return HuntOutcome(
             url=url,
             final_url=page.final_url,
@@ -299,6 +316,10 @@ class AmazonHunterAgent:
             suggested_outbox_type=outbox_type,
             enqueued_outbox_id=outbox_id,
             discarded_reason=None,
+            affiliate_url=(affiliate.affiliate_url if affiliate else None),
+            affiliate_store_id=(affiliate.store_id if affiliate else None),
+            affiliate_tracking_id=(affiliate.tracking_id if affiliate else None),
+            affiliate_error=(affiliate.error if affiliate else None),
         )
 
     # ------------------------------------------------------------------
@@ -437,6 +458,8 @@ class AmazonHunterAgent:
         product: ExtractedProduct,
         scoring,
         outbox_type: str,
+        *,
+        affiliate: Optional[AffiliateInfo] = None,
     ) -> Optional[int]:
         if self.db is None:
             return None
@@ -448,14 +471,33 @@ class AmazonHunterAgent:
             )
             return None
 
+        affiliate_url = affiliate.affiliate_url if affiliate else None
         payload = {
             "title": product.title,
             "current_price": product.current_price,
             "previous_price": product.previous_price,
             "discount_percent": product.discount_percent,
             "image_url": product.image_url,
-            "url": product.canonical_url,
+            "url": affiliate_url or product.canonical_url,
+            "canonical_url": product.canonical_url,
+            "affiliate_url": affiliate_url,
+            "affiliate_status": (
+                "ok" if affiliate and affiliate.success and affiliate_url else
+                "failed" if affiliate and affiliate.error else
+                None
+            ),
+            "affiliate_error": (
+                None if affiliate and affiliate.success and affiliate_url else
+                affiliate.error if affiliate and affiliate.error else
+                None
+            ),
+            "affiliate_store_id": affiliate.store_id if affiliate else None,
+            "affiliate_tracking_id": affiliate.tracking_id if affiliate else None,
+            "affiliate_commission_category": affiliate.commission_category if affiliate else None,
+            "affiliate_commission_rate": affiliate.commission_rate if affiliate else None,
             "marketplace": product.marketplace,
+            "brand": product.brand_guess,
+            "category": product.category_guess,
             "asin": product.asin,
             "confidence_label": scoring.confidence_label,
             "score": scoring.score,
@@ -479,7 +521,40 @@ class AmazonHunterAgent:
                 json.dumps(payload, ensure_ascii=False),
             ),
         )
+        self._update_product_affiliate(product, affiliate)
         return cur.lastrowid
+
+    async def _maybe_extract_affiliate(
+        self,
+        product: ExtractedProduct,
+    ) -> Optional[AffiliateInfo]:
+        if self.affiliate_extractor is None:
+            return None
+        target_url = product.canonical_url or product.url
+        if not target_url:
+            return AffiliateInfo(success=False, error="no_canonical_url")
+        try:
+            return await self.affiliate_extractor.extract(target_url)
+        except Exception as exc:
+            logger.warning(
+                "amazon affiliate extractor raised for %s: %s",
+                target_url,
+                exc,
+            )
+            return AffiliateInfo(success=False, error=f"unexpected: {exc}")
+
+    def _update_product_affiliate(
+        self,
+        product: ExtractedProduct,
+        affiliate: Optional[AffiliateInfo],
+    ) -> None:
+        if self.db is None or affiliate is None or not affiliate.affiliate_url:
+            return
+        self.db.execute(
+            "UPDATE products SET affiliate_link = COALESCE(?, affiliate_link) "
+            "WHERE url_canonical = ?",
+            (affiliate.affiliate_url, product.canonical_url),
+        )
 
     def _save_discard(self, *, url: str, reason: str, payload: dict) -> None:
         if self.db is None:

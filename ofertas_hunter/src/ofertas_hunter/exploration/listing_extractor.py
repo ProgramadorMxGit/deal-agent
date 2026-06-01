@@ -11,16 +11,37 @@ Soporta:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Iterable, Optional
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from ..extraction.price_parser import calculate_discount, extract_discount_percent
 from .url_classifier import ClassifiedUrl, classify
 
 
 _DEFAULT_AMAZON_BASE = "https://www.amazon.com.mx"
 _DEFAULT_ML_BASE = "https://www.mercadolibre.com.mx"
+
+
+@dataclass
+class MercadoLibreListingItem:
+    """Item extraído a nivel de tarjeta (card) de un listing ML.
+
+    Contiene metadata mínima de precio/descuento cuando está visible en la
+    tarjeta, para permitir un prefiltro temprano antes de pagar el costo de
+    abrir la página del producto con Playwright. Todos los campos de precio
+    son opcionales: el listing no siempre los expone.
+    """
+
+    url: str
+    kind: str
+    title: Optional[str] = None
+    current_price: Optional[float] = None
+    original_price: Optional[float] = None
+    discount_percent: Optional[float] = None
+    raw_discount_text: Optional[str] = None
 
 
 def _normalize(url: str, base: str) -> str:
@@ -166,3 +187,167 @@ def extract_mercadolibre_listing(
             discovered.append(info)
 
     return _dedup_classified(discovered)
+
+
+# ---------------------------------------------------------------------------
+# Mercado Libre — extracción a nivel de tarjeta (card) con metadata de precio
+# ---------------------------------------------------------------------------
+
+
+_ML_CARD_SELECTORS = (
+    "li.ui-search-layout__item",
+    "div.ui-search-result__wrapper",
+    "div.andes-card",
+    "div.poly-card",
+)
+
+_ML_PRODUCT_LINK_SELECTORS = (
+    "a.ui-search-link",
+    "a.ui-search-item__group__element",
+    "a.poly-component__title",
+    "a[href*='/p/MLM']",
+    "a[href*='/MLM']",
+)
+
+_OFF_TEXT_RE = re.compile(r"\d{1,3}\s*%\s*(?:OFF|de descuento)", re.IGNORECASE)
+
+
+def _amount_from_card_element(el) -> Optional[float]:
+    """Combina `andes-money-amount__fraction` + `__cents` dentro de un nodo."""
+    if el is None:
+        return None
+    fraction_el = el.find(class_="andes-money-amount__fraction")
+    if not fraction_el:
+        return None
+    fraction_text = re.sub(r"[^\d]", "", fraction_el.get_text())
+    if not fraction_text:
+        return None
+    fraction = int(fraction_text)
+    cents_el = el.find(class_=lambda c: c and "andes-money-amount__cents" in c)
+    cents = 0
+    if cents_el:
+        cents_text = re.sub(r"[^\d]", "", cents_el.get_text())
+        if cents_text:
+            cents = int(cents_text)
+    return round(fraction + cents / 100, 2)
+
+
+def _extract_card_discount_text(card) -> Optional[str]:
+    """Texto de descuento visible en la card (`50% OFF`), si existe."""
+    discount_el = card.find(
+        class_=lambda c: c and "andes-money-amount__discount" in c
+    )
+    if discount_el:
+        text = discount_el.get_text(strip=True)
+        if text:
+            return text
+    # Fallback: cualquier texto "% OFF" / "% de descuento" dentro de la card.
+    match = card.find(string=_OFF_TEXT_RE)
+    if match:
+        return str(match).strip()
+    return None
+
+
+def _extract_card_prices(card) -> tuple[Optional[float], Optional[float]]:
+    """Devuelve (current_price, original_price) leídos de la card.
+
+    El precio anterior suele venir tachado (`<s>` o `--previous`); el actual
+    es el primer `andes-money-amount` que no sea ni previous ni discount.
+
+    Usamos selectores CSS de clase (token exacto) para no confundir los
+    contenedores `andes-money-amount` con los spans internos
+    `andes-money-amount__fraction` / `__cents`.
+    """
+    original = None
+    previous_el = card.select_one(".andes-money-amount--previous")
+    if previous_el is None:
+        previous_el = card.find("s")
+    if previous_el is not None:
+        original = _amount_from_card_element(previous_el)
+
+    current = None
+    for el in card.select(".andes-money-amount"):
+        classes = el.get("class") or []
+        if "andes-money-amount--previous" in classes:
+            continue
+        if any("__discount" in c for c in classes):
+            continue
+        val = _amount_from_card_element(el)
+        if val is not None:
+            current = val
+            break
+
+    return current, original
+
+
+def extract_mercadolibre_listing_items(
+    html: str, base_url: Optional[str] = None
+) -> list[MercadoLibreListingItem]:
+    """Extrae items (con metadata de precio/descuento) desde un listing ML.
+
+    A diferencia de `extract_mercadolibre_listing` (que devuelve sólo URLs
+    clasificadas), esta función trabaja a nivel de **tarjeta**: por cada card
+    intenta leer el link del producto y, si están visibles, el descuento, el
+    precio actual y el precio anterior. Esto habilita un prefiltro temprano.
+
+    Mantiene el flujo existente intacto: es una función nueva y aditiva.
+    """
+    if not html:
+        return []
+    base = base_url or _DEFAULT_ML_BASE
+    soup = BeautifulSoup(html, "html.parser")
+
+    cards = []
+    for sel in _ML_CARD_SELECTORS:
+        found = soup.select(sel)
+        if found:
+            cards = found
+            break
+
+    items: list[MercadoLibreListingItem] = []
+    seen: set[str] = set()
+
+    for card in cards:
+        link = None
+        for sel in _ML_PRODUCT_LINK_SELECTORS:
+            link = card.select_one(sel)
+            if link and link.get("href"):
+                break
+        if not link or not link.get("href"):
+            continue
+
+        url = _normalize(link["href"], base)
+        info = classify(url)
+        if info.kind != "product":
+            continue
+        if info.url in seen:
+            continue
+        seen.add(info.url)
+
+        title = link.get("title") or link.get_text(strip=True) or None
+
+        current, original = _extract_card_prices(card)
+
+        raw_discount_text = _extract_card_discount_text(card)
+        discount_percent: Optional[float] = None
+        pct = extract_discount_percent(raw_discount_text) if raw_discount_text else None
+        if pct is not None:
+            discount_percent = float(pct)
+        else:
+            calc = calculate_discount(current, original)
+            if calc is not None and calc > 0:
+                discount_percent = float(calc)
+
+        items.append(
+            MercadoLibreListingItem(
+                url=info.url,
+                kind="product",
+                title=title,
+                current_price=current,
+                original_price=original,
+                discount_percent=discount_percent,
+                raw_discount_text=raw_discount_text,
+            )
+        )
+
+    return items

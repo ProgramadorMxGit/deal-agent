@@ -2,9 +2,10 @@
 """
 orquestador_ia.py — Orquestador autónomo con salida visual Rich.
 
-Tres loops independientes en paralelo:
+Loops independientes en paralelo:
   - Amazon:     discover + hunt continuo
   - ML:         discover + hunt continuo
+  - Telegram:   backfill continuo de canales configurados
   - Dispatcher: dispatch_outbox continuo (respeta cooldown 5 min)
 
 Supervisión IA: kiro-cli analiza el rendimiento cada 10 ciclos de Amazon.
@@ -15,6 +16,7 @@ Uso:
 """
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -30,12 +32,82 @@ from rich.text import Text
 from rich.table import Table
 from rich import box
 
-KIRO_CLI = r"C:\Users\yarteaga\AppData\Local\Kiro-Cli\kiro-cli.exe"
-BOT_DIR  = Path(__file__).resolve().parents[1]
+def _resolve_kiro_cli() -> str:
+    """Resuelve la ruta a kiro-cli según OS y entorno.
+
+    1. Var de entorno ``KIRO_CLI`` (override explícito).
+    2. Windows: ``%LOCALAPPDATA%\\Kiro-Cli\\kiro-cli.exe``.
+    3. Linux/Mac: ``~/.local/bin/kiro-cli`` o ``shutil.which("kiro-cli")``.
+    """
+    import os as _os
+    import shutil as _shutil
+
+    override = _os.environ.get("KIRO_CLI")
+    if override and Path(override).exists():
+        return override
+    if _sys.platform == "win32":
+        candidates = [
+            Path(_os.environ.get("LOCALAPPDATA", "")) / "Kiro-Cli" / "kiro-cli.exe",
+            Path.home() / "AppData" / "Local" / "Kiro-Cli" / "kiro-cli.exe",
+        ]
+    else:
+        candidates = [
+            Path.home() / ".local" / "bin" / "kiro-cli",
+            Path("/usr/local/bin/kiro-cli"),
+            Path("/usr/bin/kiro-cli"),
+        ]
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    on_path = _shutil.which("kiro-cli")
+    if on_path:
+        return on_path
+    # Fallback: nombre simple para que el subprocess falle limpio
+    return "kiro-cli"
+
 
 # En Windows la consola legacy no soporta emojis — usamos ASCII puro
 import sys as _sys
 _IS_WIN_LEGACY = _sys.platform == "win32"
+
+KIRO_CLI = _resolve_kiro_cli()
+BOT_DIR  = Path(__file__).resolve().parents[1]
+
+MCP_TIMEOUTS = {
+    "discover_seeds": 60,
+    "hunt_amazon": 180,
+    "hunt_mercadolibre": 180,
+    "process_telegram": 45,
+    "dispatch_outbox": 45,
+    "enrich_amazon_affiliates": 240,
+    "get_frontier_stats": 30,
+    "pause_marketplace": 15,
+}
+
+# Cada cuántos ciclos del dispatcher se corre el enriquecimiento de
+# afiliados Amazon (los items Amazon sin afiliado válido quedan bloqueados
+# por el publisher hasta ser enriquecidos).
+AMAZON_AFFILIATE_ENRICH_EVERY = 1
+AMAZON_AFFILIATE_ENRICH_LIMIT = 5
+
+
+def _env_float(name: str, default: float) -> float:
+    """Lee un float de entorno con fallback seguro (clamp a >= 0)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = float(raw)
+        return val if val >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Throttle incondicional del loop de Mercado Libre. Sin esto, cuando el
+# frontier ML está lleno (~19k URLs) y muchas se saltan rápido, el loop gira
+# a ~20 ciclos/s, quemando CPU e inflando runtime_events. Con 5s el máximo
+# es ~720 ciclos/h; con 10s, ~360 ciclos/h. Configurable vía .env.
+ML_LOOP_SLEEP_SECONDS = _env_float("ML_LOOP_SLEEP_SECONDS", 5.0)
 
 console = Console(highlight=False)
 
@@ -53,9 +125,11 @@ _ICON_PUBLISH  = "[OK]" if _IS_WIN_LEGACY else "✅"
 _stats = {
     "amazon_cycles": 0,
     "ml_cycles": 0,
+    "telegram_cycles": 0,
     "dispatch_cycles": 0,
     "amazon_enqueued": 0,
     "ml_enqueued": 0,
+    "telegram_enqueued": 0,
     "dispatched": 0,
     "amazon_captchas": 0,
     "start_time": time.time(),
@@ -86,6 +160,16 @@ def log_warn(msg: str) -> None:
     console.print(f"  [bold red]{_ICON_WARN} [WARN][/bold red] {msg}")
 
 
+async def dispatch_mcp(server, tool: str, args: dict) -> dict:
+    """Ejecuta una tool MCP sin dejar que bloquee indefinidamente un loop."""
+    timeout = MCP_TIMEOUTS.get(tool, 60)
+    try:
+        return await asyncio.wait_for(server.dispatch(tool, args), timeout=timeout)
+    except asyncio.TimeoutError:
+        log_warn(f"{tool}: timeout tras {timeout}s; se reintentara en el proximo ciclo")
+        return {"error": "timeout", "tool": tool, "timeout_seconds": timeout}
+
+
 def log_status() -> None:
     elapsed = int(time.time() - _stats["start_time"])
     h, m = divmod(elapsed // 60, 60)
@@ -106,6 +190,10 @@ def log_status() -> None:
     table.add_row(
         "ML ciclos", str(_stats["ml_cycles"]),
         "ML encoladas", str(_stats["ml_enqueued"]),
+    )
+    table.add_row(
+        "Telegram ciclos", str(_stats["telegram_cycles"]),
+        "Telegram encoladas", str(_stats["telegram_enqueued"]),
     )
     if _stats["amazon_captchas"]:
         table.add_row("CAPTCHAs Amazon", str(_stats["amazon_captchas"]), "", "")
@@ -131,7 +219,7 @@ def ask_kiro_agent(prompt: str, agent: str = "ofertas-orquestador", timeout: int
     """
     try:
         result = subprocess.run(
-            [KIRO_CLI, "chat", "--agent", agent, "--trust-all-tools", "--no-interactive", prompt],
+            [KIRO_CLI, "--classic", "chat", "--agent", agent, "--trust-all-tools", "--no-interactive", prompt],
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace", cwd=str(BOT_DIR),
         )
@@ -159,7 +247,7 @@ def ask_kiro(prompt: str, timeout: int = 30) -> str:
     """Llamada simple sin agente — para análisis rápido."""
     try:
         result = subprocess.run(
-            [KIRO_CLI, "chat", "--no-interactive", prompt],
+            [KIRO_CLI, "--classic", "chat", "--no-interactive", prompt],
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace", cwd=str(BOT_DIR),
         )
@@ -176,12 +264,12 @@ async def loop_amazon(server, once: bool) -> None:
     log_amazon("Loop arrancado", "green")
     while True:
         try:
-            disc = await server.dispatch("discover_seeds", {"marketplace": "amazon", "limit": 4})
+            disc = await dispatch_mcp(server, "discover_seeds", {"marketplace": "amazon", "limit": 4})
             persisted = disc.get("persisted", 0)
             if persisted:
                 log_amazon(f"+{persisted} URLs al frontier", "green")
 
-            hunt = await server.dispatch("hunt_amazon", {"limit": 5})
+            hunt = await dispatch_mcp(server, "hunt_amazon", {"limit": 5})
             enqueued = hunt.get("enqueued", 0)
             processed = hunt.get("processed", 0)
             _stats["amazon_cycles"] += 1
@@ -231,7 +319,7 @@ async def loop_amazon(server, once: bool) -> None:
                     f"Amazon: {len(real_high_captchas)} CAPTCHAs reales "
                     "high-confidence — pausando 10 min"
                 )
-                await server.dispatch("pause_marketplace", {
+                await dispatch_mcp(server, "pause_marketplace", {
                     "marketplace": "amazon",
                     "reason": "captcha_burst",
                     "ttl_seconds": 600,
@@ -245,7 +333,7 @@ async def loop_amazon(server, once: bool) -> None:
                 log_warn("Amazon: 1 captcha real — backoff corto 60s (sin pausa global)")
                 await asyncio.sleep(60)
 
-            frontier = await server.dispatch("get_frontier_stats", {"marketplace": "amazon"})
+            frontier = await dispatch_mcp(server, "get_frontier_stats", {"marketplace": "amazon"})
             if frontier.get("total", 0) == 0:
                 await asyncio.sleep(30)
 
@@ -267,12 +355,12 @@ async def loop_ml(server, once: bool) -> None:
     log_ml("Loop arrancado", "yellow")
     while True:
         try:
-            disc = await server.dispatch("discover_seeds", {"marketplace": "mercadolibre", "limit": 4})
+            disc = await dispatch_mcp(server, "discover_seeds", {"marketplace": "mercadolibre", "limit": 4})
             persisted = disc.get("persisted", 0)
             if persisted:
                 log_ml(f"+{persisted} URLs al frontier", "yellow")
 
-            hunt = await server.dispatch("hunt_mercadolibre", {"limit": 5})
+            hunt = await dispatch_mcp(server, "hunt_mercadolibre", {"limit": 5})
 
             if hunt.get("skipped") and hunt.get("reason") == "ml_paused_for_login":
                 log_warn("ML: cookies expiradas — pausando 30 min")
@@ -291,7 +379,7 @@ async def loop_ml(server, once: bool) -> None:
                     f"  procesados=[white]{processed}[/white]  {enq_str}"
                 )
 
-            frontier = await server.dispatch("get_frontier_stats", {"marketplace": "mercadolibre"})
+            frontier = await dispatch_mcp(server, "get_frontier_stats", {"marketplace": "mercadolibre"})
             if frontier.get("total", 0) == 0:
                 await asyncio.sleep(30)
 
@@ -304,6 +392,52 @@ async def loop_ml(server, once: bool) -> None:
         if once:
             break
 
+        # Throttle incondicional: evita el runaway del loop ML cuando el
+        # frontier no está vacío (ver ML_LOOP_SLEEP_SECONDS). No afecta
+        # Amazon ni Telegram. Si es 0, no duerme (no recomendado).
+        if ML_LOOP_SLEEP_SECONDS > 0:
+            await asyncio.sleep(ML_LOOP_SLEEP_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Loop Telegram
+# ---------------------------------------------------------------------------
+
+async def loop_telegram(server, once: bool) -> None:
+    log_dispatch("Telegram loop arrancado", "magenta")
+    while True:
+        try:
+            result = await dispatch_mcp(server, "process_telegram", {"limit": 80, "budget": 40})
+            if result.get("skipped"):
+                log_warn(f"Telegram: skipped={result.get('reason')}")
+                return
+            if result.get("error"):
+                log_warn(f"Telegram ERROR: {result.get('error')} {result.get('detail', '')}")
+                await asyncio.sleep(60)
+            else:
+                enqueued = int(result.get("enqueued", 0) or 0)
+                _stats["telegram_cycles"] += 1
+                _stats["telegram_enqueued"] += enqueued
+                if result.get("processed", 0):
+                    console.print(
+                        f"  [bold magenta][TG]  [Telegram][/bold magenta] "
+                        f"ciclo [cyan]#{_stats['telegram_cycles']}[/cyan] "
+                        f"procesados=[white]{result.get('processed', 0)}[/white] "
+                        f"actionable={result.get('actionable', 0)} "
+                        f"duplicates={result.get('duplicates', 0)} "
+                        f"[bold green]+{enqueued} encoladas[/bold green]"
+                    )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log_warn(f"Telegram ERROR: {e}")
+            await asyncio.sleep(30)
+
+        if once:
+            break
+        await asyncio.sleep(30)
+
 
 # ---------------------------------------------------------------------------
 # Loop Dispatcher
@@ -313,7 +447,27 @@ async def loop_dispatcher(server, once: bool) -> None:
     log_dispatch("Loop arrancado", "cyan")
     while True:
         try:
-            result = await server.dispatch("dispatch_outbox", {"limit": 3})
+            # Fase de afiliados: antes de despachar, enriquecer items Amazon
+            # `pending` sin affiliate_url. El publisher BLOQUEA Amazon sin
+            # afiliado válido, así que sin esta fase esos items nunca salen.
+            if _stats["dispatch_cycles"] % AMAZON_AFFILIATE_ENRICH_EVERY == 0:
+                try:
+                    enr = await dispatch_mcp(
+                        server,
+                        "enrich_amazon_affiliates",
+                        {"limit": AMAZON_AFFILIATE_ENRICH_LIMIT},
+                    )
+                    if enr.get("success") and enr.get("enriched"):
+                        console.print(
+                            f"  [bold cyan]{_ICON_DISPATCH} [Afiliados][/bold cyan] "
+                            f"Amazon enriquecidos=[bold green]{enr.get('enriched')}[/bold green] "
+                            f"fallidos={enr.get('failed', 0)} "
+                            f"candidatos={enr.get('total_candidates', 0)}"
+                        )
+                except Exception as e:  # noqa: BLE001 - nunca congelar el loop
+                    log_warn(f"Afiliados Amazon ERROR: {e}")
+
+            result = await dispatch_mcp(server, "dispatch_outbox", {"limit": 3})
             ticks = result.get("ticks", 0)
             if ticks > 0:
                 _stats["dispatched"] += ticks
@@ -323,6 +477,12 @@ async def loop_dispatcher(server, once: bool) -> None:
                     f"- total=[bold white]{_stats['dispatched']}[/bold white]"
                 )
             else:
+                if _stats["dispatch_cycles"] < 3 or _stats["dispatch_cycles"] % 6 == 0:
+                    log_dispatch(
+                        f"ciclo #{_stats['dispatch_cycles'] + 1}: sin publicacion "
+                        "(cooldown, sin elegibles o selector sin candidato)",
+                        "dim",
+                    )
                 await asyncio.sleep(10)
             _stats["dispatch_cycles"] += 1
 
@@ -359,7 +519,7 @@ async def loop_ia_supervision(server, once: bool) -> None:
 
                 # Ejecutar dispatch directamente (no necesita IA)
                 try:
-                    dispatch = await server.dispatch("dispatch_outbox", {"limit": 3})
+                    dispatch = await dispatch_mcp(server, "dispatch_outbox", {"limit": 3})
                     ticks = dispatch.get("ticks", 0)
                     if ticks > 0:
                         _stats["dispatched"] += ticks
@@ -417,12 +577,45 @@ async def main_async(once: bool) -> None:
     from ofertas_hunter.db import connect, init_db
     from ofertas_hunter.mcp.context import ServerContext
     from ofertas_hunter.mcp.server import MCPServer
+    from ofertas_hunter.session.ml_session_runtime import MLSessionRecoveryRuntime
 
     s = get_settings()
     init_db()
     conn = connect()
+
+    # Aplica el throttle ML desde config/.env (pydantic lee .env aunque no
+    # esté exportado al entorno). El default del módulo es 5s; aquí se
+    # respeta `ml_loop_sleep_seconds` si está definido en config/.env.
+    global ML_LOOP_SLEEP_SECONDS
+    try:
+        cfg_sleep = float(getattr(s, "ml_loop_sleep_seconds", ML_LOOP_SLEEP_SECONDS))
+        if cfg_sleep >= 0:
+            ML_LOOP_SLEEP_SECONDS = cfg_sleep
+    except (TypeError, ValueError):
+        pass
     ctx = ServerContext.build(db=conn, settings=s)
     server = MCPServer(ctx)
+
+    # ── ML Session Recovery: monitor + webhook entrante ──────────────────
+    # Detecta cookie_expiry → avisa al admin via WhatsApp → recibe JSON
+    # de cookies → hot-reload sin reiniciar el bot.
+    async def _evolution_send(number: str, text: str) -> bool:
+        """Wrapper para mandar WhatsApp al admin via Evolution API."""
+        try:
+            client = ctx.get_evolution_client()
+            resp = await client.send_text(number, text)
+            return bool(resp.success)
+        except Exception as exc:
+            log_warn(f"ML Recovery: send_text falló: {exc}")
+            return False
+
+    ml_recovery = MLSessionRecoveryRuntime.build(
+        settings=s,
+        db=conn,
+        evolution_send=_evolution_send,
+        ctx=ctx,
+    )
+    await ml_recovery.start()
 
     # Header de inicio
     console.print()
@@ -436,30 +629,49 @@ async def main_async(once: bool) -> None:
                 "bold green" if s.publishing_enabled else "bold yellow"
             ),
             ("Scheduler: ", "dim"), (ctx.scheduler.decide().mode.value, "bold green"),
+            ("\nML throttle: ", "dim"), (f"{ML_LOOP_SLEEP_SECONDS:g}s/ciclo", "bold cyan"),
         ),
         title="[bold cyan]OFERTAS HUNTER - Orquestador IA[/bold cyan]",
-        subtitle="[dim]Amazon + ML en loops independientes[/dim]",
+        subtitle="[dim]Amazon + ML + Telegram + Dispatch[/dim]",
         border_style="cyan",
         padding=(0, 2),
     ))
     console.print()
+
+    async def loop_ml_recovery(once: bool) -> None:
+        """Loop que llama a monitor.tick() cada 30s para detectar
+        cookie_expiry y avisar al admin via WhatsApp."""
+        while True:
+            try:
+                result = await ml_recovery.monitor_tick()
+                if result == "ml_session_admin_alerted":
+                    log_warn("ML Recovery: cookies expiradas — aviso enviado al admin via WhatsApp")
+            except Exception as exc:
+                log_warn(f"ML Recovery monitor error: {exc}")
+            if once:
+                break
+            await asyncio.sleep(30)
 
     try:
         if once:
             await asyncio.gather(
                 loop_amazon(server, once=True),
                 loop_ml(server, once=True),
+                loop_telegram(server, once=True),
                 loop_dispatcher(server, once=True),
             )
         else:
             await asyncio.gather(
                 loop_amazon(server, once=False),
                 loop_ml(server, once=False),
+                loop_telegram(server, once=False),
                 loop_dispatcher(server, once=False),
                 loop_ia_supervision(server, once=False),
                 loop_status(server, once=False),
+                loop_ml_recovery(once=False),
             )
     finally:
+        await ml_recovery.stop()
         await ctx.aclose()
         conn.close()
 

@@ -1,21 +1,4 @@
-"""Cola persistente de publicación.
-
-Implementa la API requerida por la spec:
-
-- `enqueue(item)` — añade a la cola.
-- `pick_random_eligible(now, last_normal_at)` — elige aleatoriamente entre
-  los items elegibles (errores de precio inmediato, normales que cumplen
-  cooldown, candidatos a revalidar). No es FIFO.
-- `revalidate_age_threshold(now)` — devuelve los items con > `revalidate_after`
-  de antigüedad que necesitan revalidación.
-- `mark_published(item, evolution_response)`.
-- `mark_failed(item, error)`.
-- `mark_discarded(item, reason)`.
-
-Esta versión es **in-memory + DB-backed**: persiste en SQLite cuando se le da
-una conexión, pero también funciona sin DB para tests unitarios deterministas.
-La capa async/serializada del dispatcher vive en `dispatcher.py` (Fase 3).
-"""
+"""Persistent outbox queue."""
 
 from __future__ import annotations
 
@@ -24,43 +7,27 @@ import random
 import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Iterator, Optional
+from typing import Iterator, Optional
 
+from ..db import execute_with_retry, run_with_retry
 from ..models import OutboxItem, OutboxState, OutboxType
 from .cooldown import CooldownPolicy
 
 
-# ---------------------------------------------------------------------------
-# Configuración
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class OutboxConfig:
-    revalidate_age_seconds: int = 3600  # 1 hora
+    revalidate_age_seconds: int = 3600
     cooldown: CooldownPolicy = field(default_factory=CooldownPolicy)
 
 
-# ---------------------------------------------------------------------------
-# Outbox in-memory (suficiente para tests unitarios)
-# ---------------------------------------------------------------------------
-
-
 class InMemoryOutbox:
-    """Cola en memoria con la misma API pública que la versión SQLite.
-
-    Útil para tests unitarios y para uso temprano en desarrollo.
-    """
+    """In-memory outbox with the same public API as the SQLite version."""
 
     def __init__(self, config: Optional[OutboxConfig] = None) -> None:
         self.config = config or OutboxConfig()
         self._items: list[OutboxItem] = []
         self._next_id = 1
         self._rng = random.Random()
-
-    # ------------------------------------------------------------------
-    # API
-    # ------------------------------------------------------------------
 
     def enqueue(self, item: OutboxItem) -> OutboxItem:
         if item.id is None:
@@ -77,14 +44,11 @@ class InMemoryOutbox:
         last_normal_publication_at: Optional[datetime],
         now: Optional[datetime] = None,
     ) -> list[OutboxItem]:
-        """Items pendientes que pueden publicarse en este instante.
-
-        Aplica cooldown a los `normal` y bypass a los `price_error` /
-        `possible_pe`.
-        """
         now = now or datetime.now(timezone.utc)
         eligible: list[OutboxItem] = []
         for item in self.pending():
+            if (item.message_payload or {}).get("requires_live_validation") is True:
+                continue
             if item.scheduled_for and item.scheduled_for > now:
                 continue
             if self.config.cooldown.is_publishable(
@@ -98,30 +62,26 @@ class InMemoryOutbox:
         last_normal_publication_at: Optional[datetime],
         now: Optional[datetime] = None,
     ) -> Optional[OutboxItem]:
-        """Elige aleatoriamente uno de los elegibles.
-
-        Si hay errores de precio, los **prioriza** sobre las ofertas normales
-        antes de aleatorizar (la spec exige prioridad máxima para PE).
-        """
         eligible = self.eligible_now(last_normal_publication_at, now)
         if not eligible:
             return None
         price_errors = [
-            i for i in eligible if i.type in (OutboxType.PRICE_ERROR.value, OutboxType.POSSIBLE_PE.value)
+            i
+            for i in eligible
+            if i.type in (OutboxType.PRICE_ERROR.value, OutboxType.POSSIBLE_PE.value)
         ]
         if price_errors:
             return self._rng.choice(price_errors)
         return self._rng.choice(eligible)
 
-    def needs_revalidation(
-        self, now: Optional[datetime] = None
-    ) -> list[OutboxItem]:
+    def needs_revalidation(self, now: Optional[datetime] = None) -> list[OutboxItem]:
         now = now or datetime.now(timezone.utc)
         threshold = timedelta(seconds=self.config.revalidate_age_seconds)
         return [
             i
             for i in self.pending()
-            if (now - i.enqueued_at) > threshold
+            if (i.message_payload or {}).get("requires_live_validation") is True
+            or (now - i.enqueued_at) > threshold
         ]
 
     def mark_published(
@@ -135,13 +95,36 @@ class InMemoryOutbox:
             last_attempt_at=now,
         )
 
-    def mark_failed(self, item: OutboxItem, now: Optional[datetime] = None) -> OutboxItem:
+    def mark_failed(
+        self, item: OutboxItem, now: Optional[datetime] = None
+    ) -> OutboxItem:
         now = now or datetime.now(timezone.utc)
         return self._update(
             item,
             state=OutboxState.FAILED.value,
             attempts=item.attempts + 1,
             last_attempt_at=now,
+        )
+
+    def mark_retry_later(
+        self,
+        item: OutboxItem,
+        *,
+        now: Optional[datetime] = None,
+        delay_seconds: int = 120,
+        error: Optional[str] = None,
+    ) -> OutboxItem:
+        now = now or datetime.now(timezone.utc)
+        new_payload = dict(item.message_payload)
+        if error:
+            new_payload["last_publish_error"] = error
+        return self._update(
+            item,
+            state=OutboxState.PENDING.value,
+            attempts=item.attempts + 1,
+            last_attempt_at=now,
+            scheduled_for=now + timedelta(seconds=max(1, int(delay_seconds))),
+            message_payload=new_payload,
         )
 
     def mark_discarded(self, item: OutboxItem, reason: str) -> OutboxItem:
@@ -159,12 +142,11 @@ class InMemoryOutbox:
         new_payload: dict,
         now: Optional[datetime] = None,
     ) -> OutboxItem:
-        """Reemplaza el payload tras una revalidación exitosa."""
-        return self._update(item, message_payload=new_payload, enqueued_at=now or datetime.now(timezone.utc))
-
-    # ------------------------------------------------------------------
-    # Helpers internos
-    # ------------------------------------------------------------------
+        return self._update(
+            item,
+            message_payload=new_payload,
+            enqueued_at=now or datetime.now(timezone.utc),
+        )
 
     def _update(self, item: OutboxItem, **changes) -> OutboxItem:
         for idx, existing in enumerate(self._items):
@@ -181,17 +163,8 @@ class InMemoryOutbox:
         return len(self._items)
 
 
-# ---------------------------------------------------------------------------
-# Outbox SQLite (Fase 2/3)
-# ---------------------------------------------------------------------------
-
-
 class SqliteOutbox(InMemoryOutbox):
-    """Outbox respaldada por SQLite. Hereda la lógica de in-memory y se
-    sincroniza con la DB.
-
-    Es deliberadamente sencilla: cada operación traduce a INSERT/UPDATE.
-    """
+    """SQLite-backed outbox with short transactions and retry on lock."""
 
     def __init__(
         self, conn: sqlite3.Connection, config: Optional[OutboxConfig] = None
@@ -200,15 +173,13 @@ class SqliteOutbox(InMemoryOutbox):
         self.conn = conn
         self._load_from_db()
 
-    # ------------------------------------------------------------------
-    # Persistencia
-    # ------------------------------------------------------------------
-
     def _load_from_db(self) -> None:
-        cur = self.conn.execute(
+        cur = execute_with_retry(
+            self.conn,
             "SELECT id, offer_id, type, enqueued_at, scheduled_for, attempts, "
             "       last_attempt_at, state, message_payload_json "
-            "FROM outbox ORDER BY id ASC"
+            "FROM outbox ORDER BY id ASC",
+            description="outbox load",
         )
         self._items = []
         max_id = 0
@@ -231,7 +202,8 @@ class SqliteOutbox(InMemoryOutbox):
 
     def enqueue(self, item: OutboxItem) -> OutboxItem:
         item = super().enqueue(item)
-        self.conn.execute(
+        execute_with_retry(
+            self.conn,
             "INSERT INTO outbox(id, offer_id, type, enqueued_at, scheduled_for, "
             "attempts, last_attempt_at, state, message_payload_json) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -246,12 +218,14 @@ class SqliteOutbox(InMemoryOutbox):
                 item.state,
                 json.dumps(item.message_payload, ensure_ascii=False),
             ),
+            description=f"outbox enqueue id={item.id}",
         )
         return item
 
     def _update(self, item: OutboxItem, **changes) -> OutboxItem:
         updated = super()._update(item, **changes)
-        self.conn.execute(
+        execute_with_retry(
+            self.conn,
             "UPDATE outbox SET offer_id=?, type=?, enqueued_at=?, scheduled_for=?, "
             "attempts=?, last_attempt_at=?, state=?, message_payload_json=? "
             "WHERE id=?",
@@ -266,6 +240,7 @@ class SqliteOutbox(InMemoryOutbox):
                 json.dumps(updated.message_payload, ensure_ascii=False),
                 updated.id,
             ),
+            description=f"outbox update id={updated.id}",
         )
         return updated
 
@@ -274,39 +249,66 @@ class SqliteOutbox(InMemoryOutbox):
         last_normal_publication_at: Optional[datetime],
         now: Optional[datetime] = None,
     ) -> Optional[OutboxItem]:
-        """Versión atómica para SQLite: recarga desde DB y marca in_flight
-        antes de devolver el item, evitando duplicados entre procesos.
-        """
         now = now or datetime.now(timezone.utc)
-        # Recargar desde DB para tener el estado más fresco
-        self._load_from_db()
-        item = super().pick_random_eligible(last_normal_publication_at, now)
-        if item is None:
-            return None
-        # Marcar como in_flight atómicamente
-        self.conn.execute(
-            "UPDATE outbox SET state = ? WHERE id = ? AND state = ?",
-            (OutboxState.IN_FLIGHT.value, item.id, OutboxState.PENDING.value),
+
+        def _claim_once() -> Optional[OutboxItem]:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self._load_from_db()
+                item = super(SqliteOutbox, self).pick_random_eligible(
+                    last_normal_publication_at,
+                    now,
+                )
+                if item is None:
+                    self.conn.commit()
+                    return None
+
+                cur = self.conn.execute(
+                    "UPDATE outbox SET state = ? WHERE id = ? AND state = ?",
+                    (OutboxState.IN_FLIGHT.value, item.id, OutboxState.PENDING.value),
+                )
+                if cur.rowcount != 1:
+                    self.conn.commit()
+                    return None
+
+                self.conn.commit()
+                return InMemoryOutbox._update(
+                    self,
+                    item,
+                    state=OutboxState.IN_FLIGHT.value,
+                )
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+        return run_with_retry(
+            _claim_once,
+            description="outbox claim item",
         )
-        self.conn.commit()
-        # Verificar que realmente lo tomamos nosotros
-        row = self.conn.execute(
-            "SELECT state FROM outbox WHERE id = ?", (item.id,)
-        ).fetchone()
-        if row is None or (row["state"] if isinstance(row, dict) else row[0]) != OutboxState.IN_FLIGHT.value:
-            return None  # Otro proceso lo tomó primero
-        return item
 
+    def eligible_now(
+        self,
+        last_normal_publication_at: Optional[datetime],
+        now: Optional[datetime] = None,
+    ) -> list[OutboxItem]:
+        return super().eligible_now(last_normal_publication_at, now)
 
-# ---------------------------------------------------------------------------
-# Helpers de datetime
-# ---------------------------------------------------------------------------
+    def needs_revalidation(self, now: Optional[datetime] = None) -> list[OutboxItem]:
+        self._load_from_db()
+        return super().needs_revalidation(now=now)
 
 
 def _fmt_dt(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (
+        dt.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _fmt_dt_optional(dt: Optional[datetime]) -> Optional[str]:
@@ -314,8 +316,7 @@ def _fmt_dt_optional(dt: Optional[datetime]) -> Optional[str]:
 
 
 def _parse_dt(value: str) -> datetime:
-    s = value.replace("Z", "+00:00")
-    return datetime.fromisoformat(s)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _parse_dt_optional(value: Optional[str]) -> Optional[datetime]:

@@ -1,0 +1,11 @@
+[Unit]
+Description=ofertas_hunter — saneamiento outbox (cada 6h)
+
+[Timer]
+OnBootSec=45min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=ofertas-hunter-saneamiento.service
+
+[Install]
+WantedBy=timers.target

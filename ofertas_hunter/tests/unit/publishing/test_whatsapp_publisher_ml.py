@@ -98,7 +98,12 @@ async def test_whatsapp_allows_ml_without_affiliate_when_not_required(dry_run_cl
 
 @pytest.mark.asyncio
 async def test_whatsapp_amazon_does_not_require_affiliate(dry_run_client):
-    """La regla afiliado solo aplica a marketplace='mercadolibre'."""
+    """La regla afiliado de ML solo aplica a marketplace='mercadolibre'.
+
+    Amazon tiene su propio gate (afiliado válido + precio anterior
+    verificado). Aquí el item Amazon cumple ambos, así que publica: prueba
+    que la regla *de ML* no es la que lo bloquea.
+    """
     publisher = WhatsAppPublisher(
         client=dry_run_client,
         target_group_id="120363@g.us",
@@ -115,6 +120,8 @@ async def test_whatsapp_amazon_does_not_require_affiliate(dry_run_client):
             "discount_percent": 57,
             "image_url": "https://m.media-amazon.com/images/I/abc.jpg",
             "marketplace": "amazon",
+            "affiliate_url": "https://amzn.to/4e3yTjG",
+            "old_price_verified": True,
             "url": "https://amzn.to/4e3yTjG",
         },
     )

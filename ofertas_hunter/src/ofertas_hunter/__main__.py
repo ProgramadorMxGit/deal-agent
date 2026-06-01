@@ -26,22 +26,7 @@ from typing import Optional
 
 from .config import Settings, get_settings
 from .db import connection, init_db
-from .dispatching.cooldown import CooldownPolicy
-from .dispatching.dispatcher import OutboxDispatcher, make_sqlite_published_recorder
-from .dispatching.outbox import OutboxConfig, SqliteOutbox
 from .logging_setup import configure_logging
-from .models import OutboxItem, OutboxType
-from .publishing.evolution_client import EvolutionClient
-from .publishing.whatsapp_publisher import WhatsAppPublisher
-from .telegram.candidate_builder import (
-    LISTENER_DEAL,
-    LISTENER_IGNORED_ML,
-    LISTENER_NOISE,
-    LISTENER_PRICE_ERROR,
-    TelegramCandidateBuilder,
-)
-from .telegram.channel_config import parse_channels
-from .telegram.message_parser import parse_message
 
 
 logger = logging.getLogger(__name__)
@@ -73,12 +58,22 @@ def cmd_check_config(_args: argparse.Namespace) -> int:
     print(f"log_level: {s.log_level}")
     print(f"db_path: {s.db_path_resolved}")
     print(f"amazon_enabled: {s.amazon_enabled}")
+    print(f"amazon_user_data_dir: {s.amazon_user_data_dir or '(unset)'}")
+    print(f"amazon_cookies_path: {s.amazon_cookies_path}")
     print(f"mercadolibre_enabled: {s.mercadolibre_enabled}")
     print(f"telegram_enabled: {s.telegram_enabled}")
     print(f"telegram_channels: {s.telegram_channel_list}")
     print(f"whatsapp_enabled: {s.whatsapp_enabled}")
     print(f"publishing_enabled: {s.publishing_enabled}")
     print(f"publishing_dry_run: {s.publishing_dry_run}")
+    print(f"diversity_curator_enabled: {s.diversity_curator_enabled}")
+    print(f"diversity_curator_use_llm: {s.diversity_curator_use_llm}")
+    print(f"diversity_curator_history_size: {s.diversity_curator_history_size}")
+    print(f"diversity_curator_candidate_limit: {s.diversity_curator_candidate_limit}")
+    print(
+        "diversity_curator_kiro_cli_path: "
+        f"{s.diversity_curator_kiro_cli_path or '(auto)'}"
+    )
     print(f"evolution_base_url: {s.evolution_base_url or '(unset)'}")
     print(f"evolution_instance: {s.evolution_instance or '(unset)'}")
     print(f"whatsapp_group: {s.whatsapp_group or '(unset)'}")
@@ -94,6 +89,19 @@ def cmd_check_config(_args: argparse.Namespace) -> int:
 
 
 def _build_dispatcher(s: Settings):
+    from .dispatching.cooldown import CooldownPolicy
+    from .dispatching.curator_factory import build_diversity_curator
+    from .dispatching.dispatcher import (
+        OutboxDispatcher,
+        RevalidationResult,
+        make_sqlite_duplicate_checker,
+        make_sqlite_published_recorder,
+        make_stale_price_checker,
+    )
+    from .dispatching.outbox import OutboxConfig, SqliteOutbox
+    from .publishing.evolution_client import EvolutionClient
+    from .publishing.whatsapp_publisher import WhatsAppPublisher
+    from .runtime.scheduler import OperatingScheduler, ScheduleConfig
     """Construye el dispatcher leyendo config + DB. Devuelve también la
     conexión y el publisher para que el caller los cierre.
     """
@@ -113,20 +121,96 @@ def _build_dispatcher(s: Settings):
         base_url=s.evolution_base_url,
         api_key=s.evolution_api_key,
         instance=s.evolution_instance,
+        api_key_header=s.evolution_api_key_header,
         dry_run=s.publishing_dry_run,
     )
     publisher = WhatsAppPublisher(
         client=client,
         target_group_id=s.whatsapp_group,
         enabled=s.publishing_enabled,
+        mercadolibre_affiliate_required=s.mercadolibre_affiliate_required_for_publish,
+        amazon_affiliate_required=s.amazon_affiliate_required_for_publish,
+        amazon_min_discount_percent=s.amazon_min_discount_percent,
+        amazon_extreme_discount_threshold=s.amazon_extreme_discount_threshold,
+        amazon_min_absolute_price=s.amazon_min_absolute_price,
+    )
+
+    class _LazyDispatchRevalidator:
+        def __init__(self) -> None:
+            self.browser = None
+            self.revalidator = None
+
+        async def revalidate(self, item):
+            if self.revalidator is None:
+                try:
+                    from .browser.browser_context import BrowserConfig
+                    from .browser.playwright_worker import PlaywrightBrowserWorker
+                    from .revalidation.playwright_revalidator import (
+                        PlaywrightRevalidator,
+                    )
+
+                    self.browser = PlaywrightBrowserWorker(
+                        BrowserConfig(
+                            headless=s.amazon_headless,
+                            user_data_dir=s.amazon_user_data_dir,
+                            warmup_amazon_homepage=s.amazon_warmup_homepage,
+                            delay_between_requests_ms=(
+                                s.amazon_delay_between_pages_ms_min,
+                                s.amazon_delay_between_pages_ms_max,
+                            ),
+                        )
+                    )
+                    await self.browser._ensure_started()  # noqa: SLF001
+                    self.revalidator = PlaywrightRevalidator(
+                        browser=self.browser,
+                        db_conn=conn,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "dispatch revalidator unavailable item=%s: %s",
+                        item.id,
+                        exc,
+                    )
+                    return RevalidationResult(
+                        still_eligible=True,
+                        payload=item.message_payload,
+                    )
+            return await self.revalidator.revalidate(item)
+
+        async def aclose(self) -> None:
+            if self.browser is not None:
+                await self.browser.aclose()
+
+    revalidator = _LazyDispatchRevalidator()
+    dup_checker = make_sqlite_duplicate_checker(conn, hours=48)
+    stale_checker = make_stale_price_checker(max_age_hours=4)
+
+    def _combined_checker(item):
+        return dup_checker(item) or stale_checker(item)
+
+    curator = build_diversity_curator(conn, s)
+    item_selector = curator.pick if curator is not None else None
+    scheduler = OperatingScheduler(
+        ScheduleConfig.from_env(
+            enabled=s.schedule_enabled,
+            timezone_name=s.schedule_timezone,
+            hibernate_start=s.hibernate_start,
+            hibernate_end=s.hibernate_end,
+            warmup_start=s.warmup_start,
+            active_start=s.active_start,
+        )
     )
     dispatcher = OutboxDispatcher(
         outbox=outbox,
         publisher=publisher,
         published_recorder=make_sqlite_published_recorder(conn),
+        duplicate_checker=_combined_checker,
+        item_selector=item_selector,
+        revalidator=revalidator,
         idle_sleep_seconds=s.dispatcher_idle_sleep_seconds,
+        scheduler=scheduler,
     )
-    return dispatcher, client, conn
+    return dispatcher, client, conn, revalidator
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
@@ -142,7 +226,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             "Evolution API)."
         )
 
-    dispatcher, client, conn = _build_dispatcher(s)
+    dispatcher, client, conn, revalidator = _build_dispatcher(s)
 
     async def _run():
         try:
@@ -151,6 +235,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             else:
                 await dispatcher.run_forever()
         finally:
+            await revalidator.aclose()
             await client.aclose()
             conn.close()
 
@@ -162,6 +247,10 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 def cmd_enqueue_sample(args: argparse.Namespace) -> int:
+    from .dispatching.cooldown import CooldownPolicy
+    from .dispatching.outbox import OutboxConfig, SqliteOutbox
+    from .models import OutboxItem, OutboxType
+
     """Encola una oferta de prueba en el outbox SQLite.
 
     Útil para validar el dispatcher sin tener todavía hunters reales.
@@ -310,6 +399,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_telegram_check_config(_args: argparse.Namespace) -> int:
+    from .telegram.channel_config import parse_channels
+
     s = get_settings()
     print(f"telegram_enabled: {s.telegram_enabled}")
     print(f"api_id: {_redact(str(s.resolved_telegram_api_id) if s.resolved_telegram_api_id else None)}")
@@ -333,6 +424,9 @@ def cmd_telegram_check_config(_args: argparse.Namespace) -> int:
 
 
 def cmd_telegram_parse_sample(args: argparse.Namespace) -> int:
+    from .telegram.candidate_builder import TelegramCandidateBuilder
+    from .telegram.message_parser import parse_message
+
     """Parsea un fixture local sin tocar Telegram."""
     fixture_path = Path(args.path)
     if not fixture_path.exists():
@@ -389,6 +483,8 @@ def cmd_telegram_parse_sample(args: argparse.Namespace) -> int:
 
 
 def cmd_telegram_listen(args: argparse.Namespace) -> int:
+    from .telegram.channel_config import parse_channels
+
     """Modo `--once`: hace un backfill corto y termina.
 
     Si TELEGRAM_ENABLED=false, sólo imprime que está deshabilitado.
@@ -493,14 +589,28 @@ def _build_browser(no_headless: bool, *, user_data_dir: Optional[str] = None):
     )
 
 
+async def _prepare_amazon_browser(browser, settings: Settings):
+    from .session.amazon_session import AmazonSession
+
+    session = AmazonSession.from_settings(
+        cookies_path=settings.amazon_cookies_path,
+    )
+    return await session.inject_into_browser(browser)
+
+
 def cmd_amazon_parse_url(args: argparse.Namespace) -> int:
     """Descarga una URL Amazon y muestra los datos extraídos."""
     from .extraction.amazon_product_parser import AmazonProductParser
+    s = get_settings()
 
     async def _run():
-        browser = _build_browser(args.no_headless)
+        browser = _build_browser(
+            args.no_headless,
+            user_data_dir=s.amazon_user_data_dir,
+        )
         try:
             async with browser:
+                await _prepare_amazon_browser(browser, s)
                 page = await browser.fetch(args.url)
         finally:
             await browser.aclose()
@@ -540,8 +650,10 @@ def cmd_amazon_hunt(args: argparse.Namespace) -> int:
     """Corre el AmazonHunterAgent contra N seeds."""
     from .agents.amazon_hunter_agent import AmazonHunterAgent
     from .db import connect
+    from .marketplaces.amazon_affiliate import PlaywrightAffiliateExtractor
 
     init_db()
+    s = get_settings()
 
     seeds = list(args.seed)
     if not seeds:
@@ -558,11 +670,21 @@ def cmd_amazon_hunt(args: argparse.Namespace) -> int:
     seeds = seeds[: args.limit]
 
     async def _run():
-        browser = _build_browser(args.no_headless)
+        browser = _build_browser(
+            args.no_headless,
+            user_data_dir=s.amazon_user_data_dir,
+        )
         conn = connect()
         try:
             async with browser:
-                agent = AmazonHunterAgent(browser=browser, db_conn=conn)
+                await _prepare_amazon_browser(browser, s)
+                agent = AmazonHunterAgent(
+                    browser=browser,
+                    db_conn=conn,
+                    affiliate_extractor=PlaywrightAffiliateExtractor(
+                        browser._context  # noqa: SLF001
+                    ),
+                )
                 outcomes = await agent.hunt_urls(seeds, max_urls=args.limit)
         finally:
             await browser.aclose()
@@ -575,6 +697,143 @@ def cmd_amazon_hunt(args: argparse.Namespace) -> int:
             )
             title = (o.extracted.title if o.extracted and o.extracted.title else "(no title)")[:60]
             print(f"{status:30s} | {o.url} | {title}")
+        return 0
+
+    try:
+        return asyncio.run(_run())
+    except KeyboardInterrupt:
+        return 1
+
+
+def cmd_amazon_enrich_affiliates(args: argparse.Namespace) -> int:
+    """Regenera affiliate_url en items Amazon del outbox."""
+    from .agents.amazon_affiliate_enricher import AmazonAffiliateEnricher
+    from .db import connect
+    from .marketplaces.amazon_affiliate import PlaywrightAffiliateExtractor
+    from .runtime.profile_lock import ProfileLock
+
+    init_db()
+    s = get_settings()
+    lock_path = str(
+        Path(s.amazon_user_data_dir or "secrets/browser_profiles/amazon") / ".profile.lock"
+    )
+
+    async def _run():
+        # Filelock cross-process: si el orquestador está usando el perfil,
+        # esperamos un poco antes de fallar (no abrir un 2º Chromium).
+        profile_lock = ProfileLock(lock_path)
+        waited = 0.0
+        while not profile_lock.try_acquire():
+            if waited >= 60.0:
+                print(
+                    "  ERROR: perfil Amazon ocupado (orquestador u otro proceso). "
+                    "Reintenta luego o detén el orquestador."
+                )
+                return 2
+            await asyncio.sleep(3.0)
+            waited += 3.0
+
+        browser = _build_browser(
+            args.no_headless,
+            user_data_dir=s.amazon_user_data_dir,
+        )
+        conn = connect()
+        try:
+            async with browser:
+                await _prepare_amazon_browser(browser, s)
+                enricher = AmazonAffiliateEnricher(
+                    conn,
+                    PlaywrightAffiliateExtractor(browser._context),  # noqa: SLF001
+                )
+                report = await enricher.run(limit=args.limit)
+        finally:
+            await browser.aclose()
+            conn.close()
+            profile_lock.release()
+
+        print("--- amazon-enrich-affiliates ---")
+        print(f"  candidates: {report.total_candidates}")
+        print(f"  enriched:   {report.enriched}")
+        print(f"  failed:     {report.failed}")
+        print(f"  skipped:    {report.skipped}")
+        for outcome in report.outcomes[:20]:
+            label = outcome.status.upper()
+            tail = (
+                f"affiliate={outcome.affiliate_url}"
+                if outcome.status == "ok"
+                else f"error={outcome.error}"
+            )
+            print(f"  [{label:7s}] outbox_id={outcome.outbox_id} | {tail}")
+        return 0
+
+    try:
+        return asyncio.run(_run())
+    except KeyboardInterrupt:
+        return 1
+
+
+def cmd_amazon_sanitize_outbox(args: argparse.Namespace) -> int:
+    """Sanea el outbox Amazon: enriquece afiliados y bloquea lo no publicable.
+
+    - Enriquece afiliados faltantes (SiteStripe) si Playwright está disponible.
+    - Bloquea (state=discarded) items Amazon que no cumplen las reglas duras,
+      usando razones granulares espejo del gate de publicación:
+      `amazon_missing_affiliate`, `amazon_no_verified_old_price`,
+      `amazon_current_price_unverified`, `amazon_unit_price_as_current_price`,
+      `amazon_extreme_discount_unverified`, `amazon_current_price_suspicious`,
+      `amazon_telegram_needs_pdp_revalidation`.
+    - Con `--dry-run` solo clasifica y reporta (no enriquece ni escribe).
+    """
+    from .agents.amazon_affiliate_enricher import AmazonAffiliateEnricher
+    from .agents.amazon_outbox_sanitizer import sanitize_amazon_outbox
+    from .db import connect
+    from .marketplaces.amazon_affiliate import PlaywrightAffiliateExtractor
+
+    init_db()
+    s = get_settings()
+
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    async def _run():
+        conn = connect()
+        enricher = None
+        browser = None
+        try:
+            # En dry-run nunca abrimos browser ni enriquecemos (no escribir nada).
+            if not args.no_enrich and not dry_run:
+                try:
+                    browser = _build_browser(
+                        args.no_headless,
+                        user_data_dir=s.amazon_user_data_dir,
+                    )
+                    await browser._ensure_started()  # noqa: SLF001
+                    await _prepare_amazon_browser(browser, s)
+                    enricher = AmazonAffiliateEnricher(
+                        conn,
+                        PlaywrightAffiliateExtractor(browser._context),  # noqa: SLF001
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  (enricher no disponible: {exc}; solo se bloqueará)")
+                    enricher = None
+
+            report = await sanitize_amazon_outbox(
+                conn, enricher=enricher, enrich_limit=args.limit, dry_run=dry_run
+            )
+        finally:
+            if browser is not None:
+                await browser.aclose()
+            conn.close()
+
+        title = "amazon-sanitize-outbox" + (" (DRY-RUN)" if dry_run else "")
+        print(f"--- {title} ---")
+        print(f"  total Amazon revisados:        {report.total}")
+        print(f"  ya OK (afiliado + old price):  {report.already_ok}")
+        print(f"  enriquecidos (afiliado nuevo): {report.enriched}")
+        print(f"  enrich fallidos:               {report.enrich_failed}")
+        verb = "se bloquearían" if dry_run else "bloqueados"
+        print(f"  {verb} (total):               {report.blocked_total}")
+        for reason, count in sorted(report.blocked_by_reason.items()):
+            print(f"    - {reason}: {count}")
         return 0
 
     try:
@@ -807,6 +1066,92 @@ def cmd_compress_memory(_args: argparse.Namespace) -> int:
     print(f"  agent_runs deleted:           {report.deleted_agent_runs}")
     print(f"  summaries:                    {report.summary_kinds}")
     return 0
+
+
+def cmd_nightly_maintenance(args: argparse.Namespace) -> int:
+    """Mantenimiento nocturno seguro: purga runtime_events + VACUUM + restart.
+
+    Por seguridad corre en --dry-run salvo que se pase --run. Fuera de la
+    ventana nocturna no hace nada salvo --force-window (prueba manual).
+    """
+    from dataclasses import replace as _replace
+
+    from .maintenance.nightly import NightlyMaintenanceConfig, NightlyMaintenanceRunner
+    from .maintenance.environment import SystemMaintenanceEnvironment
+
+    s = get_settings()
+    init_db()
+
+    config = NightlyMaintenanceConfig.from_settings(s)
+    if getattr(args, "batch_size", None):
+        config = _replace(config, batch_size=int(args.batch_size))
+    if getattr(args, "max_seconds", None):
+        config = _replace(config, max_seconds=int(args.max_seconds))
+
+    # Default seguro: dry-run salvo --run explícito.
+    dry_run = (not args.run) or args.dry_run
+
+    env = SystemMaintenanceEnvironment(
+        service_name=getattr(s, "nightly_maintenance_service_name", "ofertas-hunter.service"),
+        db_path=s.db_path_resolved,
+        use_sudo=bool(getattr(s, "nightly_maintenance_use_sudo", True)),
+    )
+
+    def _local_clock() -> datetime:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(config.timezone_name))
+        except Exception:  # noqa: BLE001
+            return datetime.now(timezone.utc)
+
+    runner = NightlyMaintenanceRunner(
+        db_path=s.db_path_resolved,
+        config=config,
+        env=env,
+        clock=_local_clock,
+        force_window=args.force_window,
+        dry_run=dry_run,
+        skip_vacuum=args.skip_vacuum,
+        no_restart=args.no_restart,
+    )
+    summary = runner.run()
+
+    if args.json:
+        print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
+        return 0 if (summary.success or summary.skipped) else 2
+
+    mode = "DRY-RUN" if summary.dry_run else "RUN"
+    print(f"--- nightly-maintenance ({mode}) ---")
+    if summary.skipped:
+        print(f"  SKIPPED: {summary.skip_reason}")
+        print(f"  safe_window: {summary.safe_window}")
+        return 0
+    print(f"  started_at:            {summary.started_at}")
+    print(f"  finished_at:           {summary.finished_at}")
+    print(f"  duration_seconds:      {summary.duration_seconds}")
+    print(f"  success:               {summary.success}")
+    print(f"  quick_check:           {summary.quick_check}")
+    print(f"  runtime_events before: {summary.runtime_events_before}")
+    print(f"  runtime_events after:  {summary.runtime_events_after}")
+    print(f"  rows_candidate:        {summary.rows_candidate}")
+    print(f"  rows_deleted:          {summary.rows_deleted}  (batches={summary.purge_batches})")
+    print(f"  db_size_before:        {summary.db_size_before}")
+    print(f"  db_size_after:         {summary.db_size_after}")
+    print(f"  disk_free_gb_before:   {summary.disk_free_gb_before:.2f}")
+    print(f"  disk_free_gb_after:    {summary.disk_free_gb_after:.2f}")
+    print(f"  vacuum_done:           {summary.vacuum_done} ({summary.vacuum_skipped_reason or 'ok'})")
+    print(f"  integrity_check:       {summary.integrity_check}")
+    print(f"  service_stopped:       {summary.service_stopped}")
+    print(f"  service_started:       {summary.service_started}")
+    print(f"  restart_done:          {summary.restart_done}")
+    print(f"  outbox before:         {summary.outbox_counts_before}")
+    print(f"  outbox after:          {summary.outbox_counts_after}")
+    if summary.warnings:
+        print(f"  warnings:              {summary.warnings}")
+    if summary.errors:
+        print(f"  errors:                {summary.errors}")
+    return 0 if summary.success else 2
 
 
 def cmd_export_memory_summary(args: argparse.Namespace) -> int:
@@ -1392,7 +1737,68 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
                 len(server.registry),
                 ctx.scheduler.decide().mode.value,
             )
-            await server.serve_stdio()
+
+            # ── ML Session Recovery ──────────────────────────────────────
+            # Arranca el monitor de cookies + webhook entrante junto con
+            # el MCP server. Funciona en TODOS los modos (kiro-cli [1],
+            # subagentes [2], orquestador_ia.py [3]).
+            from .session.ml_session_alerting import build_ml_session_alert_sender
+            from .session.ml_session_runtime import MLSessionRecoveryRuntime
+            from .publishing.evolution_client import EvolutionClient
+
+            async def _evolution_send_mcp(number: str, text: str) -> bool:
+                try:
+                    client = EvolutionClient(
+                        base_url=s.evolution_base_url,
+                        api_key=s.evolution_api_key,
+                        instance=s.evolution_instance,
+                        api_key_header=s.evolution_api_key_header,
+                        dry_run=s.publishing_dry_run,
+                    )
+                    async with client:
+                        resp = await client.send_text(number, text)
+                    return bool(resp.success)
+                except Exception as exc:
+                    logger.warning("ML Recovery send_text falló: %s", exc)
+                    return False
+
+            alert_send = build_ml_session_alert_sender(
+                s,
+                whatsapp_send=_evolution_send_mcp,
+            )
+
+            ml_recovery = MLSessionRecoveryRuntime.build(
+                settings=s,
+                db=conn,
+                evolution_send=_evolution_send_mcp,
+                alert_send=alert_send,
+                ctx=ctx,
+            )
+            await ml_recovery.start()
+
+            async def _monitor_loop() -> None:
+                """Llama a monitor.tick() cada 30s en background."""
+                import asyncio as _asyncio
+                while True:
+                    try:
+                        await ml_recovery.monitor_tick()
+                    except Exception:
+                        pass
+                    await _asyncio.sleep(30)
+
+            import asyncio as _asyncio
+            monitor_task = _asyncio.create_task(_monitor_loop())
+
+            try:
+                await server.serve_stdio()
+            finally:
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except _asyncio.CancelledError:
+                    pass
+                await ml_recovery.stop()
+
         finally:
             try:
                 await ctx.aclose()
@@ -1494,6 +1900,33 @@ def main(argv: list[str] | None = None) -> int:
     sp_hunt.add_argument("--seed", action="append", default=[],
                          help="URL de producto (puede repetirse). Si está vacío, lee de config/seeds/amazon.json.")
 
+    sp_aenr = sub.add_parser(
+        "amazon-enrich-affiliates",
+        help="Regenera affiliate_url en items Amazon existentes del outbox.",
+    )
+    sp_aenr.add_argument("--limit", type=int, default=20)
+    sp_aenr.add_argument("--no-headless", action="store_true")
+
+    sp_asan = sub.add_parser(
+        "amazon-sanitize-outbox",
+        help=(
+            "Sanea outbox Amazon: enriquece afiliados y bloquea items sin "
+            "afiliado válido o sin precio anterior verificado."
+        ),
+    )
+    sp_asan.add_argument("--limit", type=int, default=200)
+    sp_asan.add_argument("--no-headless", action="store_true")
+    sp_asan.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="No intentar enriquecer afiliados; solo clasificar y bloquear.",
+    )
+    sp_asan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Clasifica y reporta sin modificar el outbox (no enriquece ni bloquea).",
+    )
+
     sp_rev = sub.add_parser(
         "revalidate-outbox",
         help="Revalida items pendientes con Playwright (>1h o telegram).",
@@ -1534,6 +1967,30 @@ def main(argv: list[str] | None = None) -> int:
         "compress-memory",
         help="Compacta tablas auditables y genera memory_summaries.",
     )
+
+    sp_nightly = sub.add_parser(
+        "nightly-maintenance",
+        help=(
+            "Mantenimiento nocturno seguro: purga runtime_events + VACUUM + "
+            "restart. Default DRY-RUN salvo --run."
+        ),
+    )
+    sp_nightly.add_argument("--run", action="store_true",
+                            help="Ejecuta de verdad (sin esto corre dry-run).")
+    sp_nightly.add_argument("--dry-run", action="store_true",
+                            help="Fuerza dry-run aunque se pase --run.")
+    sp_nightly.add_argument("--force-window", action="store_true",
+                            help="Ignora la ventana nocturna (solo prueba manual).")
+    sp_nightly.add_argument("--skip-vacuum", action="store_true",
+                            help="No correr VACUUM (solo purga).")
+    sp_nightly.add_argument("--no-restart", action="store_true",
+                            help="No reiniciar el servicio al terminar.")
+    sp_nightly.add_argument("--max-seconds", type=int, default=None)
+    sp_nightly.add_argument("--batch-size", type=int, default=None)
+    sp_nightly.add_argument("--backup", action="store_true",
+                            help="Crear backup comprimido antes de limpiar.")
+    sp_nightly.add_argument("--json", action="store_true",
+                            help="Imprime el summary como JSON.")
 
     sp_export = sub.add_parser(
         "export-memory-summary",
@@ -1658,6 +2115,35 @@ def main(argv: list[str] | None = None) -> int:
         help="No tomar el lockfile (usar SOLO en tests in-process).",
     )
 
+    # ---- Saneamiento (housekeeping del outbox) ------------------------------
+    sp_san = sub.add_parser(
+        "saneamiento",
+        help="Bot de saneamiento (housekeeping del outbox). Dry-run por defecto.",
+    )
+    sp_san.add_argument(
+        "--task",
+        choices=(
+            "outbox-stale",
+            "outbox-duplicates",
+            "outbox-bad-discounts",
+            "outbox-missing-prev-price",
+            "all",
+        ),
+        default="all",
+        help="Tarea a ejecutar (default: all).",
+    )
+    sp_san.add_argument(
+        "--apply",
+        action="store_true",
+        help="Sin este flag, la run es Dry_Run (no escribe cambios).",
+    )
+    sp_san.add_argument(
+        "--marketplace",
+        choices=("amazon", "mercadolibre", "all"),
+        default="all",
+        help="Filtrar por marketplace (default: all).",
+    )
+
     args = parser.parse_args(argv)
     configure_logging(args.log_level or get_settings().log_level)
 
@@ -1684,6 +2170,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_amazon_parse_url(args)
     if args.command == "amazon-hunt":
         return cmd_amazon_hunt(args)
+    if args.command == "amazon-enrich-affiliates":
+        return cmd_amazon_enrich_affiliates(args)
+    if args.command == "amazon-sanitize-outbox":
+        return cmd_amazon_sanitize_outbox(args)
     if args.command == "revalidate-outbox":
         return cmd_revalidate_outbox(args)
     if args.command == "revalidate-url":
@@ -1692,6 +2182,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ml_enrich_affiliates(args)
     if args.command == "compress-memory":
         return cmd_compress_memory(args)
+    if args.command == "nightly-maintenance":
+        return cmd_nightly_maintenance(args)
     if args.command == "export-memory-summary":
         return cmd_export_memory_summary(args)
     if args.command == "check-db":
@@ -1708,6 +2200,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(args)
     if args.command == "mcp-serve":
         return cmd_mcp_serve(args)
+    if args.command == "saneamiento":
+        # Local import: el módulo `saneamiento` no debe cargarse cuando se
+        # ejecutan otros subcomandos (Requirement 2.3 — aislamiento por proceso).
+        from .saneamiento.cli import cmd_saneamiento
+        return cmd_saneamiento(args)
     parser.print_help()
     return 1
 

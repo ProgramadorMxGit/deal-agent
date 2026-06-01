@@ -99,3 +99,79 @@ class TestPriceErrorFormatter:
                 url="https://x.com/p/x",
                 image_url="https://x.com/img.jpg",
             )
+
+
+
+# ---------------------------------------------------------------------------
+# Coherencia precio↔descuento (bug del Kingston SD: badge 67% pero real 13%)
+# ---------------------------------------------------------------------------
+
+
+def test_formatter_corrects_inflated_discount_when_prices_dont_match():
+    """Si el ``discount_percent`` reportado no cuadra con la diferencia
+    real entre ``previous_price`` y ``current_price``, el formatter
+    recalcula y usa el valor real.
+    """
+    from ofertas_hunter.publishing.formatter import format_normal_offer
+
+    msg = format_normal_offer(
+        title="Kingston Canvas Select Plus 256GB",
+        current_price=780.0,
+        previous_price=899.0,
+        discount_percent=67.0,  # mal extraído (real es 13%)
+        url="https://amzn.to/x",
+        image_url="https://m.media-amazon.com/img.jpg",
+    )
+    # Usa cálculo real: (899 - 780) / 899 ≈ 13.2% → "13%"
+    assert "13%" in msg.text
+    assert "67%" not in msg.text
+    assert "$899" in msg.text
+    assert "$780" in msg.text
+
+
+def test_formatter_preserves_discount_when_prices_match():
+    from ofertas_hunter.publishing.formatter import format_normal_offer
+
+    msg = format_normal_offer(
+        title="JBL Tune 510BT",
+        current_price=388.0,
+        previous_price=899.0,
+        discount_percent=57.0,  # cuadra con el cálculo real (56.84%)
+        url="https://amzn.to/x",
+        image_url="https://m.media-amazon.com/img.jpg",
+    )
+    assert "57%" in msg.text
+
+
+def test_formatter_rejects_when_previous_price_is_missing():
+    from ofertas_hunter.publishing.formatter import (
+        FormatterError,
+        format_normal_offer,
+    )
+
+    with pytest.raises(FormatterError, match="previous_price"):
+        format_normal_offer(
+            title="X",
+            current_price=100.0,
+            previous_price=None,  # sin precio anterior
+            discount_percent=50.0,
+            url="https://x",
+            image_url="https://m.media-amazon.com/img.jpg",
+        )
+
+
+def test_formatter_rejects_when_previous_lte_current():
+    from ofertas_hunter.publishing.formatter import (
+        FormatterError,
+        format_normal_offer,
+    )
+
+    with pytest.raises(FormatterError, match="must be <"):
+        format_normal_offer(
+            title="X",
+            current_price=100.0,
+            previous_price=100.0,
+            discount_percent=50.0,
+            url="https://x",
+            image_url="https://m.media-amazon.com/img.jpg",
+        )

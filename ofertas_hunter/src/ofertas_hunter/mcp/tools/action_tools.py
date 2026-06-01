@@ -260,6 +260,75 @@ async def _h_hunt_mercadolibre(ctx: Any, args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# process_telegram
+# ---------------------------------------------------------------------------
+
+
+async def _h_process_telegram(ctx: Any, args: dict) -> dict:
+    settings = ctx.settings
+    if not settings.telegram_enabled:
+        return {"skipped": True, "reason": "telegram_disabled"}
+
+    try:
+        from ...agents.telegram_listener_agent import (
+            MissingCredentialsError,
+            TelegramListenerAgent,
+            TelegramListenerConfig,
+        )
+        from ...telegram.channel_config import parse_channels
+        from ...telegram.telethon_listener import TelethonAdapter, TelethonImportError
+    except Exception as exc:
+        return {"error": "telegram_import_failed", "detail": str(exc)}
+
+    limit = int(args.get("limit", settings.telegram_backfill_limit_per_channel))
+    budget = int(
+        args.get("budget", settings.telegram_backfill_process_budget_per_channel)
+    )
+    config = TelegramListenerConfig(
+        enabled=True,
+        api_id=settings.resolved_telegram_api_id,
+        api_hash=settings.resolved_telegram_api_hash,
+        session_path=str(settings.telegram_session_path_resolved),
+        target_channels=parse_channels(
+            settings.telegram_target_channels or settings.telegram_channels
+        ),
+        backfill_limit_per_channel=limit,
+        backfill_process_budget_per_channel=budget,
+        ignore_mercadolibre_links=settings.telegram_ignore_mercadolibre_links,
+        link_resolver_timeout_seconds=settings.telegram_link_resolver_timeout_seconds,
+        link_resolver_max_redirects=settings.telegram_link_resolver_max_redirects,
+        normal_offer_min_discount=settings.normal_offer_min_discount,
+        start_from_now=settings.telegram_start_from_now,
+    )
+    try:
+        adapter = TelethonAdapter(
+            api_id=config.api_id,
+            api_hash=config.api_hash,
+            session_path=config.session_path,
+        )
+    except TelethonImportError as exc:
+        return {"error": "telethon_missing", "detail": str(exc)}
+
+    agent = TelegramListenerAgent(config=config, adapter=adapter, db_conn=ctx.db)
+    try:
+        try:
+            agent.ensure_credentials()
+        except MissingCredentialsError as exc:
+            return {"error": "missing_credentials", "detail": str(exc)}
+        outcomes = await agent.backfill_once()
+    finally:
+        await agent.aclose()
+
+    return {
+        "success": True,
+        "processed": len(outcomes),
+        "actionable": sum(1 for outcome in outcomes if outcome.candidate.is_actionable),
+        "duplicates": sum(1 for outcome in outcomes if outcome.duplicate),
+        "enqueued": sum(1 for outcome in outcomes if outcome.outbox_id is not None),
+        "ignored": sum(1 for outcome in outcomes if outcome.candidate.is_ignored),
+    }
+
+
 # dispatch_outbox
 # ---------------------------------------------------------------------------
 
@@ -278,6 +347,98 @@ async def _h_dispatch_outbox(ctx: Any, args: dict) -> dict:
             if outcome.success and not outcome.skipped and not outcome.dry_run:
                 ctx.record_normal_publication()
     return {"success": True, "ticks": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# enrich_amazon_affiliates
+# ---------------------------------------------------------------------------
+
+
+async def _h_enrich_amazon_affiliates(ctx: Any, args: dict) -> dict:
+    """Enriquece items Amazon `pending` sin affiliate_url usando SiteStripe.
+
+    Reutiliza `AmazonAffiliateEnricher`. Emite eventos de runtime y nunca
+    lanza: cualquier fallo se reporta como `success=False` para no congelar
+    el orquestador.
+
+    Serialización doble:
+    - `ctx.lock_for("amazon")`: serializa con hunt/discover dentro del proceso.
+    - `ProfileLock` (filelock): impide que CUALQUIER proceso (incl. CLI) abra
+      un segundo `launch_persistent_context` sobre el mismo perfil. Si está
+      ocupado, se salta y se reintenta el próximo ciclo (no abre Chromium).
+    """
+    from ...runtime.profile_lock import ProfileLock
+
+    limit = int(args.get("limit", 5))
+
+    async with ctx.lock_for("amazon"):
+        profile_lock = ProfileLock(ctx.amazon_profile_lock_path)
+        if not profile_lock.try_acquire():
+            logger.warning("amazon_profile_lock_busy: enrich skipped (reintenta luego)")
+            return {
+                "success": False,
+                "skipped": True,
+                "reason": "amazon_profile_busy",
+            }
+        logger.info("amazon_profile_lock_acquired (enrich)")
+        try:
+            try:
+                enricher = await ctx.get_amazon_affiliate_enricher()
+            except BrowserUnavailableError as exc:
+                return {"success": False, "error": "browser_unavailable", "detail": str(exc)}
+            except Exception as exc:  # noqa: BLE001 - defensivo
+                return {"success": False, "error": "enricher_unavailable", "detail": str(exc)}
+
+            logger.info("affiliate_enrich_started limit=%d", limit)
+            try:
+                report = await enricher.run(limit=limit)
+            except asyncio.CancelledError:
+                # Timeout de dispatch_mcp: garantizamos cleanup del browser.
+                logger.warning("affiliate_enrich_timeout: cancelado; limpiando browser")
+                await _cleanup_amazon_browser(ctx)
+                raise
+            except Exception as exc:  # noqa: BLE001 - defensivo
+                logger.warning("affiliate_enrich_failed: %s", exc)
+                return {"success": False, "error": "enrich_failed", "detail": str(exc)}
+
+            logger.info(
+                "affiliate_enriched enriched=%d failed=%d candidates=%d",
+                report.enriched, report.failed, report.total_candidates,
+            )
+            return {
+                "success": True,
+                "total_candidates": report.total_candidates,
+                "enriched": report.enriched,
+                "failed": report.failed,
+                "skipped": report.skipped,
+            }
+        finally:
+            profile_lock.release()
+            logger.info("amazon_profile_lock_released (enrich)")
+
+
+async def _cleanup_amazon_browser(ctx: Any) -> None:
+    """Cierra el browser persistente de Amazon de forma idempotente.
+
+    Se llama tras una cancelación/timeout para no dejar Chromium huérfano
+    sobre el perfil. El próximo `get_amazon_browser()` reabrirá uno limpio.
+    """
+    logger.info("affiliate_cleanup_started")
+    browser = getattr(ctx, "_amazon_browser", None)
+    if browser is None:
+        logger.info("affiliate_cleanup_done (no browser)")
+        return
+    try:
+        await browser.aclose()
+        logger.info("affiliate_cleanup_done")
+    except Exception as exc:  # noqa: BLE001 - cleanup nunca es fatal
+        logger.warning("affiliate_cleanup_failed: %s", exc)
+    finally:
+        # Idempotente: limpiar el singleton para forzar reapertura limpia.
+        try:
+            ctx._amazon_browser = None
+        except Exception:  # pragma: no cover - defensivo
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +609,34 @@ def build_action_tools(ctx: Any) -> list[ToolSpec]:
             safety_rules=("schedule_authority", "marketplace_paused"),
         ),
         ToolSpec(
+            name="process_telegram",
+            description=(
+                "Procesa un backfill corto de canales Telegram configurados y "
+                "encola ofertas accionables al outbox."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 50,
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 40,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=_h_process_telegram,
+            is_read_only=False,
+            safety_rules=(),
+        ),
+        ToolSpec(
             name="dispatch_outbox",
             description=(
                 "Ejecuta hasta `limit` ticks del OutboxDispatcher. Cada tick "
@@ -470,6 +659,29 @@ def build_action_tools(ctx: Any) -> list[ToolSpec]:
             handler=_h_dispatch_outbox,
             is_read_only=False,
             safety_rules=("schedule_authority",),
+        ),
+        ToolSpec(
+            name="enrich_amazon_affiliates",
+            description=(
+                "Enriquece items Amazon `pending` sin affiliate_url abriendo "
+                "el producto con Playwright + SiteStripe y copiando el enlace "
+                "corto de afiliado. Actualiza el payload del outbox. No publica."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 5,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=_h_enrich_amazon_affiliates,
+            is_read_only=False,
+            safety_rules=(),
         ),
         ToolSpec(
             name="revalidate_offer",

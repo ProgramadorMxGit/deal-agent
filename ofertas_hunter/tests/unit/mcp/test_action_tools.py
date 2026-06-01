@@ -343,6 +343,14 @@ async def test_dispatch_outbox_skipped_during_warmup(server, ctx) -> None:
     assert out["skipped"] is True
 
 
+@pytest.mark.asyncio
+async def test_process_telegram_skips_when_disabled(server, ctx) -> None:
+    ctx.settings.telegram_enabled = False
+    out = await server.dispatch("process_telegram", {"limit": 5, "budget": 5})
+    assert out["skipped"] is True
+    assert out["reason"] == "telegram_disabled"
+
+
 # ---------------------------------------------------------------------------
 # Hard rules cannot be overridden
 # ---------------------------------------------------------------------------
@@ -361,11 +369,11 @@ async def test_dispatch_outbox_rejects_force_arg(server) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Smoke: build returns 7 specs
+# Smoke: build returns expected specs
 # ---------------------------------------------------------------------------
 
 
-def test_build_action_tools_returns_seven_specs(ctx) -> None:
+def test_build_action_tools_returns_expected_specs(ctx) -> None:
     specs = build_action_tools(ctx)
     names = {s.name for s in specs}
     assert names == {
@@ -374,7 +382,9 @@ def test_build_action_tools_returns_seven_specs(ctx) -> None:
         "discover_seeds",
         "hunt_amazon",
         "hunt_mercadolibre",
+        "process_telegram",
         "dispatch_outbox",
+        "enrich_amazon_affiliates",
         "revalidate_offer",
     }
 
@@ -383,3 +393,8 @@ def test_action_tools_have_additional_properties_false(ctx) -> None:
     for spec in build_action_tools(ctx):
         d = spec.descriptor()
         assert d.inputSchema.get("additionalProperties") is False, spec.name
+
+
+def test_server_context_dispatcher_uses_revalidator(ctx) -> None:
+    dispatcher = ctx.get_dispatcher()
+    assert dispatcher.revalidator.__class__.__name__ == "_LazyRevalidator"

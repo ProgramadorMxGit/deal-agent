@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from ofertas_hunter.agents.amazon_hunter_agent import AmazonHunterAgent
 from ofertas_hunter.browser.browser_context import RenderedPage
 from ofertas_hunter.db import connect, init_db
+from ofertas_hunter.marketplaces.amazon_affiliate import (
+    AffiliateInfo,
+)
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "amazon"
@@ -26,6 +30,36 @@ class FakeBrowserWorker:
         return self.pages.get(
             url,
             RenderedPage(url=url, final_url=url, status=0, html="", error="not_mocked"),
+        )
+
+    async def aclose(self) -> None:  # pragma: no cover
+        pass
+
+
+class FakeAffiliateExtractor:
+    def __init__(
+        self,
+        *,
+        affiliate_url: str | None = "https://amzn.to/fake123",
+        store_id: str | None = "programadormx-20",
+        tracking_id: str | None = "programadormx-20",
+        error: str | None = None,
+    ) -> None:
+        self.affiliate_url = affiliate_url
+        self.store_id = store_id
+        self.tracking_id = tracking_id
+        self.error = error
+        self.calls: list[str] = []
+
+    async def extract(self, url: str) -> AffiliateInfo:
+        self.calls.append(url)
+        if self.error:
+            return AffiliateInfo(success=False, error=self.error)
+        return AffiliateInfo(
+            affiliate_url=self.affiliate_url,
+            store_id=self.store_id,
+            tracking_id=self.tracking_id,
+            success=bool(self.affiliate_url),
         )
 
     async def aclose(self) -> None:  # pragma: no cover
@@ -81,11 +115,79 @@ async def test_amazon_hunter_enqueues_offer_over_50_percent(tmp_path):
 
     outcomes = await agent.hunt_urls([url])
     assert outcomes[0].enqueued_outbox_id is not None
-    rows = conn.execute("SELECT type, state FROM outbox").fetchall()
+    rows = conn.execute("SELECT type, state, message_payload_json FROM outbox").fetchall()
     assert len(rows) == 1
     # 56.84% no es >= 50% por poco — verificamos
     assert rows[0]["type"] == "normal"
     assert rows[0]["state"] == "pending"
+    payload = json.loads(rows[0]["message_payload_json"])
+    assert payload["brand"]
+    assert payload["category"]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_amazon_hunter_outbox_payload_uses_affiliate_url_when_available(tmp_path):
+    db_path = tmp_path / "x.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    url = "https://www.amazon.com.mx/dp/B0EXAMPLEK"
+    browser = FakeBrowserWorker({url: _ok(_load("jbl_normal_offer.html"), url)})
+    extractor = FakeAffiliateExtractor()
+    agent = AmazonHunterAgent(
+        browser=browser,
+        db_conn=conn,
+        affiliate_extractor=extractor,
+    )
+
+    outcomes = await agent.hunt_urls([url])
+    assert outcomes[0].enqueued_outbox_id is not None
+    assert extractor.calls == ["https://www.amazon.com.mx/dp/B0EXAMPLEK"]
+
+    row = conn.execute("SELECT message_payload_json FROM outbox").fetchone()
+    payload = json.loads(row["message_payload_json"])
+    assert payload["affiliate_url"] == "https://amzn.to/fake123"
+    assert payload["canonical_url"] == "https://www.amazon.com.mx/dp/B0EXAMPLEK"
+    assert payload["url"] == "https://amzn.to/fake123"
+    assert payload["affiliate_status"] == "ok"
+    assert payload["affiliate_store_id"] == "programadormx-20"
+    assert payload["affiliate_tracking_id"] == "programadormx-20"
+
+    product = conn.execute(
+        "SELECT affiliate_link FROM products WHERE url_canonical = ?",
+        ("https://www.amazon.com.mx/dp/B0EXAMPLEK",),
+    ).fetchone()
+    assert product["affiliate_link"] == "https://amzn.to/fake123"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_amazon_hunter_preserves_canonical_url_when_affiliate_missing(tmp_path):
+    db_path = tmp_path / "x.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    url = "https://www.amazon.com.mx/dp/B0EXAMPLEK"
+    browser = FakeBrowserWorker({url: _ok(_load("jbl_normal_offer.html"), url)})
+    extractor = FakeAffiliateExtractor(error="clipboard_unavailable")
+    agent = AmazonHunterAgent(
+        browser=browser,
+        db_conn=conn,
+        affiliate_extractor=extractor,
+    )
+
+    outcomes = await agent.hunt_urls([url])
+    assert outcomes[0].enqueued_outbox_id is not None
+    assert outcomes[0].affiliate_error == "clipboard_unavailable"
+
+    row = conn.execute("SELECT message_payload_json FROM outbox").fetchone()
+    payload = json.loads(row["message_payload_json"])
+    assert payload.get("affiliate_url") is None
+    assert payload["canonical_url"] == "https://www.amazon.com.mx/dp/B0EXAMPLEK"
+    assert payload["url"] == "https://www.amazon.com.mx/dp/B0EXAMPLEK"
+    assert payload["affiliate_status"] == "failed"
+    assert payload["affiliate_error"] == "clipboard_unavailable"
     conn.close()
 
 
@@ -101,7 +203,9 @@ async def test_amazon_hunter_enqueues_price_error(tmp_path):
 
     outcomes = await agent.hunt_urls([url])
     assert outcomes[0].extracted is not None
-    assert outcomes[0].extracted.discount_percent == 88
+    # discount calculado: 1 - 3899/32999 ≈ 88.18%
+    assert outcomes[0].extracted.discount_percent is not None
+    assert 87.5 <= outcomes[0].extracted.discount_percent <= 88.5
     rows = conn.execute("SELECT type, state, message_payload_json FROM outbox").fetchall()
     assert len(rows) == 1
     assert rows[0]["type"] == "price_error"

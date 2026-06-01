@@ -1,0 +1,31 @@
+[Unit]
+Description=Ofertas Hunter - Mantenimiento nocturno (purga runtime_events + VACUUM + restart)
+Documentation=https://github.com/ (ver docs/NIGHTLY_MAINTENANCE.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Corre como el usuario del bot (los archivos DB/WAL quedan con el owner
+# correcto). El CLI usa `sudo -n systemctl` para detener/arrancar el servicio
+# principal (NIGHTLY_MAINTENANCE_USE_SUDO=true). Requiere sudo sin password
+# para `agaetranahoy` (ya disponible en este VPS).
+User=agaetranahoy
+Group=agaetranahoy
+WorkingDirectory=/opt/deal-agent/ofertas_hunter
+Environment=HOME=/home/agaetranahoy
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/deal-agent/ofertas_hunter/.env
+# --run ejecuta de verdad; respeta la ventana nocturna del .env (sin
+# --force-window). El propio CLI detiene y reinicia ofertas-hunter.service.
+ExecStart=/opt/deal-agent/ofertas_hunter/.venv/bin/python -m ofertas_hunter nightly-maintenance --run
+# Tope duro de tiempo (coincide con NIGHTLY_MAINTENANCE_MAX_SECONDS + margen).
+TimeoutStartSec=4200
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofertas-hunter-nightly
+
+[Install]
+WantedBy=multi-user.target

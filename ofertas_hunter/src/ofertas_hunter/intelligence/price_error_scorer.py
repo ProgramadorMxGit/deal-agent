@@ -110,9 +110,55 @@ def _fingerprint_high_end_laptop(title: Optional[str]) -> bool:
 
 
 def _fingerprint_smartphone(title: Optional[str]) -> bool:
+    """True si el título describe un smartphone real, NO un accesorio.
+
+    Importante: marcas como Redmi/Motorola/Samsung tambien venden audifonos
+    (Redmi Buds), bocinas, smartwatches, fundas, cargadores. Esos NO son
+    smartphones aunque la marca matchee. Excluimos por tokens de accesorio
+    en el titulo antes de aceptar el match de marca.
+    """
     if not title:
         return False
     t = title.lower()
+
+    # Tokens que descalifican el titulo como smartphone real (audio/accesorios).
+    _NON_SMARTPHONE_TOKENS = (
+        "buds",
+        "earbuds",
+        "earphones",
+        "headphones",
+        "headset",
+        "audífonos",
+        "audifonos",
+        "auriculares",
+        "audífono",
+        "audifono",
+        "bocina",
+        "bocinas",
+        "altavoz",
+        "altavoces",
+        "speaker",
+        "smartwatch",
+        "smart watch",
+        "smartband",
+        "smart band",
+        "watch",  # Galaxy Watch, Redmi Watch
+        "pulsera",
+        "reloj",
+        "band",  # Mi Band, Galaxy Band
+        "funda",
+        "case",
+        "cargador",
+        "cable",
+        "adaptador",
+        "mica",
+        "protector",
+        "tv",  # Smart TV Motorola, etc.
+        "monitor",
+    )
+    if any(tok in t for tok in _NON_SMARTPHONE_TOKENS):
+        return False
+
     return any(
         k in t
         for k in (

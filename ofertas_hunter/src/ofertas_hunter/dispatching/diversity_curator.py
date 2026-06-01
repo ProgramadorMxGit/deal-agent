@@ -17,6 +17,7 @@ import json
 import logging
 import sqlite3
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -63,6 +64,7 @@ class DiversityCurator:
         eligible = outbox.eligible_now(last_normal_publication_at, now)
         if not eligible:
             return None
+        eligible = self._enrich_candidates(eligible)
         # Atajo: 1 candidato → retornar directo (no LLM, no event)
         if len(eligible) == 1:
             return eligible[0]
@@ -145,9 +147,15 @@ class DiversityCurator:
         try:
             rows = self.db.execute(
                 """
-                SELECT pm.sent_at, o.message_payload_json
+                SELECT
+                    pm.sent_at,
+                    o.message_payload_json,
+                    p.brand AS product_brand,
+                    p.category AS product_category
                 FROM published_messages pm
                 JOIN outbox o ON pm.outbox_id = o.id
+                LEFT JOIN offers f ON f.id = o.offer_id
+                LEFT JOIN products p ON p.id = f.product_id
                 WHERE pm.success = 1
                 ORDER BY pm.id DESC
                 LIMIT ?
@@ -186,13 +194,61 @@ class DiversityCurator:
             history.append(
                 HistoryEntry(
                     marketplace=payload.get("marketplace") or "unknown",
-                    category=payload.get("category"),
-                    brand=payload.get("brand"),
+                    category=payload.get("category") or r["product_category"],
+                    brand=payload.get("brand") or r["product_brand"],
                     price_bucket=price_bucket(payload.get("current_price")),
                     sent_at=sent_at,
                 )
             )
         return history
+
+    def _enrich_candidates(self, items: list[OutboxItem]) -> list[OutboxItem]:
+        offer_ids = [item.offer_id for item in items if item.offer_id]
+        if not offer_ids:
+            return items
+
+        placeholders = ",".join("?" for _ in offer_ids)
+        try:
+            rows = self.db.execute(
+                f"""
+                SELECT
+                    f.id AS offer_id,
+                    p.brand AS product_brand,
+                    p.category AS product_category
+                FROM offers f
+                JOIN products p ON p.id = f.product_id
+                WHERE f.id IN ({placeholders})
+                """,
+                tuple(offer_ids),
+            ).fetchall()
+        except Exception:
+            logger.exception("DiversityCurator: candidate metadata query failed")
+            return items
+
+        meta_by_offer = {
+            int(row["offer_id"]): {
+                "brand": row["product_brand"],
+                "category": row["product_category"],
+            }
+            for row in rows
+        }
+
+        enriched: list[OutboxItem] = []
+        for item in items:
+            payload = dict(item.message_payload or {})
+            meta = meta_by_offer.get(item.offer_id)
+            if not meta:
+                enriched.append(item)
+                continue
+
+            changed = False
+            for key in ("brand", "category"):
+                if not payload.get(key) and meta.get(key):
+                    payload[key] = meta[key]
+                    changed = True
+
+            enriched.append(replace(item, message_payload=payload) if changed else item)
+        return enriched
 
     def _build_prompt(
         self,

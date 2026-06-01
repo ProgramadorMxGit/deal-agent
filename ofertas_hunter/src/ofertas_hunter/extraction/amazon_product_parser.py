@@ -63,11 +63,15 @@ _TITLE_SELECTORS = [
 _CURRENT_PRICE_SELECTORS = [
     "#priceblock_dealprice",
     "#priceblock_ourprice",
+    "#corePrice_desktop .priceToPay .a-offscreen",
+    "#corePrice_feature_div .priceToPay .a-offscreen",
+    "#apex_offerDisplay_desktop .priceToPay .a-offscreen",
+    "#apex_desktop .priceToPay .a-offscreen",
+    ".priceToPay .a-offscreen",
     "#corePrice_desktop .a-price .a-offscreen",
     "#corePrice_feature_div .a-price .a-offscreen",
     "#apex_offerDisplay_desktop .a-price .a-offscreen",
     "#apex_desktop .a-price .a-offscreen",
-    ".priceToPay .a-offscreen",
     "#price_inside_buybox",
     "#newBuyBoxPrice",
     ".a-price[data-a-color='price'] .a-offscreen",
@@ -139,6 +143,60 @@ _OUT_OF_STOCK_TOKENS = (
     "agotado",
 )
 
+_UNIT_PRICE_RE = re.compile(
+    r"(/|\bpor\b)\s*(unidad(?:es)?|unid\.?|pieza(?:s)?|pza\.?|pz\.?|kg|g|gr|ml|l|litro(?:s)?|metro(?:s)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _text_immediately_marks_unit_price(price_text: str, context_text: str) -> bool:
+    if not price_text or not context_text:
+        return False
+    compact_context = re.sub(r"\s+", " ", context_text.strip())
+    escaped = re.escape(re.sub(r"\s+", " ", price_text.strip()))
+    return bool(
+        re.search(
+            rf"{escaped}\s*(?:/|\bpor\b)\s*(?:unidad(?:es)?|unid\.?|pieza(?:s)?|pza\.?|pz\.?|kg|g|gr|ml|l|litro(?:s)?|metro(?:s)?)\b",
+            compact_context,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_unit_price_node(el) -> bool:
+    price_text = el.get_text(" ", strip=True)
+    contexts: list[str] = [price_text]
+    parent = getattr(el, "parent", None)
+    if parent is not None:
+        contexts.append(parent.get_text(" ", strip=True))
+        grandparent = getattr(parent, "parent", None)
+        if grandparent is not None:
+            contexts.append(grandparent.get_text(" ", strip=True))
+    return any(_text_immediately_marks_unit_price(price_text, ctx) for ctx in contexts)
+
+
+def _looks_like_previous_price_node(el) -> bool:
+    node = el
+    for _ in range(4):
+        if node is None:
+            return False
+        attrs = getattr(node, "attrs", {}) or {}
+        classes = attrs.get("class") or []
+        if isinstance(classes, str):
+            classes = classes.split()
+        class_text = " ".join(str(c) for c in classes).lower()
+        node_id = str(attrs.get("id") or "").lower()
+        if (
+            "basisprice" in class_text
+            or "a-text-price" in class_text
+            or attrs.get("data-a-strike") == "true"
+            or "listprice" in node_id
+            or "was_price" in node_id
+        ):
+            return True
+        node = getattr(node, "parent", None)
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Parser principal
@@ -196,17 +254,32 @@ class AmazonProductParser:
         product.raw_previous_price_text = previous_text
         product.previous_price = previous_price
 
-        # --- Discount badge ---
-        product.discount_percent = self._extract_discount_badge(soup)
+        # --- Discount badge (sólo como fallback) ---
+        badge_discount = self._extract_discount_badge(soup)
 
-        # --- Calculated discount ---
+        # --- Discount calculation: prioriza el cálculo matemático ---
+        # En Amazon hay múltiples badges (Hot Sale, cupón, "Más vendido")
+        # que pueden contener números engañosos. La fuente de verdad es la
+        # diferencia entre current_price y previous_price. El badge solo
+        # se usa cuando NO hay precio anterior para calcular.
         if product.current_price and product.previous_price:
             product.calculated_discount_percent = calculate_discount(
                 product.current_price, product.previous_price
             )
-            # Si no hay badge pero sí cálculo, usamos cálculo.
-            if product.discount_percent is None:
-                product.discount_percent = product.calculated_discount_percent
+            product.discount_percent = product.calculated_discount_percent
+            # Auditoría: si el badge difiere mucho del cálculo, marcamos
+            # warning para diagnóstico (no rechazamos).
+            if (
+                badge_discount is not None
+                and product.calculated_discount_percent is not None
+                and abs(badge_discount - product.calculated_discount_percent) > 5
+            ):
+                product.extraction_warnings.append(
+                    f"badge_vs_calc_mismatch:badge={badge_discount}_calc={product.calculated_discount_percent}"
+                )
+        else:
+            # Sin precio anterior: confiamos en el badge si existe.
+            product.discount_percent = badge_discount
 
         # --- Image ---
         product.image_url = self._extract_image(soup)
@@ -283,6 +356,8 @@ class AmazonProductParser:
                 text = el.get_text(strip=True)
                 if not text:
                     continue
+                if _looks_like_unit_price_node(el) or _looks_like_previous_price_node(el):
+                    continue
                 # Si claramente es mensualidad solo, saltar (pero registrar).
                 if detect_monthly_payment(text) and "$" not in text:
                     continue
@@ -308,6 +383,8 @@ class AmazonProductParser:
             for el in soup.select(sel):
                 text = el.get_text(strip=True)
                 if not text:
+                    continue
+                if _looks_like_unit_price_node(el):
                     continue
                 value = parse_price_text(text)
                 if value and value > 0:
@@ -370,6 +447,18 @@ class AmazonProductParser:
         atc = soup.select_one("#add-to-cart-button, #buy-now-button")
         if atc:
             return True
+        # Sin botón de compra directa pero con caja "Ver opciones de
+        # compra" / "3 opciones de $..." → producto no comprable directo
+        # (sólo via marketplace de terceros con stock variable). Tratamos
+        # como out_of_stock para no publicar precios huérfanos del DOM.
+        page_text = soup.get_text(" ", strip=True).lower()
+        if (
+            "ver opciones de compra" in page_text
+            or "see all buying options" in page_text
+            or "no disponible por el momento" in page_text
+            or "currently unavailable" in page_text
+        ):
+            return False
         return None
 
     def _extract_brand(
@@ -527,6 +616,31 @@ class AmazonProductParser:
             reasons.append("monthly_payment")
         if product.in_stock is False:
             reasons.append("out_of_stock")
+        # Coherencia de precios: previous tiene que ser > current.
+        if (
+            product.current_price is not None
+            and product.previous_price is not None
+            and product.previous_price <= product.current_price
+        ):
+            reasons.append("previous_price_not_greater")
+        # Descuento sospechosamente alto sin señal clara de stock.
+        # Cuando la diferencia es >80% Y no podemos confirmar stock
+        # (in_stock=None), lo más probable es que current/previous estén
+        # mezclados con datos de otras variantes/historial. Lo
+        # descartamos hasta tener mejor extracción.
+        if (
+            product.current_price is not None
+            and product.previous_price is not None
+            and product.previous_price > 0
+            and product.in_stock is None
+        ):
+            real = (
+                (product.previous_price - product.current_price)
+                / product.previous_price
+                * 100.0
+            )
+            if real > 80.0:
+                reasons.append("suspiciously_high_discount_unconfirmed_stock")
         return reasons
 
 

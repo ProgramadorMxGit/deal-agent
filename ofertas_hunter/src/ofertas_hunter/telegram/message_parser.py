@@ -188,12 +188,12 @@ def parse_message(
     msg_text = text or ""
 
     # Extracción de partes
+    store_mention, marketplace = _detect_store(msg_text)
     urgency = extract_urgency(msg_text)
 
     title_guess = _extract_title(msg_text)
-    written_price = _extract_price(msg_text)
+    written_price = _extract_price(msg_text, marketplace=marketplace)
     discount_visible = _extract_discount_visible(msg_text)
-    store_mention, marketplace = _detect_store(msg_text)
     brand = _detect_brand(msg_text)
     category = _detect_category(msg_text)
     urls = _extract_all_urls(msg_text)
@@ -264,9 +264,15 @@ def _extract_title(text: str) -> Optional[str]:
     return None
 
 
-def _extract_price(text: str) -> Optional[float]:
+def _extract_price(text: str, marketplace: Optional[str] = None) -> Optional[float]:
     if not text:
         return None
+
+    if marketplace == "amazon":
+        amazon_price = _extract_amazon_structured_price(text)
+        if amazon_price is not None:
+            return amazon_price
+
     candidates: list[float] = []
     for match in _PRICE_RE.finditer(text):
         raw = match.group(1)
@@ -279,6 +285,47 @@ def _extract_price(text: str) -> Optional[float]:
         return None
     # El primer precio del mensaje suele ser el principal.
     return candidates[0]
+
+
+def _extract_amazon_structured_price(text: str) -> Optional[float]:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lowered = line.lower()
+        if any(
+            token in lowered
+            for token in (
+                "compra mínima",
+                "compra minima",
+                "tope de descuento",
+                "max descuento",
+                "bonificación",
+                "bonificacion",
+                "cupón de $",
+                "cupon de $",
+            )
+        ):
+            continue
+
+        de_a_match = re.search(
+            r"\bde\s*\$?\s*([0-9][0-9\.,]*)\s*a\s*\$?\s*([0-9][0-9\.,]*)\b",
+            line,
+            re.IGNORECASE,
+        )
+        if de_a_match:
+            try:
+                return _parse_price(de_a_match.group(2))
+            except ValueError:
+                pass
+
+        if "precio oferta +" in lowered or "precio oferta:" in lowered:
+            prices = [_parse_price(match.group(1)) for match in _PRICE_RE.finditer(line)]
+            if prices:
+                return prices[-1]
+
+    return None
 
 
 def _parse_price(raw: str) -> float:

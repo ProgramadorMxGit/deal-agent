@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "name": "Sync to VPS",
+  "description": "Sube automáticamente al VPS cualquier archivo modificado del proyecto ofertas_hunter (src, tests, scripts, docs, configs, .kiro/settings).",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "ofertas_hunter/src/**/*.py",
+      "ofertas_hunter/tests/**/*.py",
+      "ofertas_hunter/scripts/*.py",
+      "ofertas_hunter/scripts/*.sh",
+      "ofertas_hunter/scripts/*.ps1",
+      "ofertas_hunter/start.sh",
+      "ofertas_hunter/start.ps1",
+      "ofertas_hunter/docs/*.md",
+      "ofertas_hunter/changes.md",
+      "ofertas_hunter/.kiro/settings/mcp.json"
+    ]
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& { $file = $env:KIRO_HOOK_FILE; if (-not $file) { exit 0 }; $base = 'C:\\Users\\yarteaga\\Desktop\\bot_autonomo_ofert\\ofertas_hunter'; if (-not $file.StartsWith($base)) { exit 0 }; $rel = $file.Substring($base.Length + 1).Replace('\\', '/'); scp -i \\\"$env:USERPROFILE\\.ssh\\gcp_ofertas_bot\\\" $file \\\"agaetranahoy@34.59.242.95:/opt/deal-agent/ofertas_hunter/$rel\\\" 2>&1 | Out-Null; Write-Host \\\"[VPS sync] $rel\\\" }\"",
+    "timeout": 30
+  }
+}

@@ -1,133 +1,58 @@
-"""OutboxDispatcher serializado.
-
-Loop principal:
-
-```
-while not stop:
-    refresh_outbox()
-    revalidate_old_items()
-    if scheduler.is_active() is False:
-        sleep_until_active()
-        continue
-    pick = outbox.pick_random_eligible(now, last_normal_at)
-    if pick is None:
-        await sleep(idle_seconds)
-        continue
-    publish(pick) -> persist published_messages -> mark outbox SENT/FAILED
-```
-
-Es **estrictamente serializado**: no se publica más de una oferta a la vez.
-
-Reglas duras (spec §6 + §14):
-
-- Cooldown global 5 minutos para `normal`.
-- Bypass para `price_error` y `possible_pe` ya validados.
-- Selección aleatoria entre los elegibles (con prioridad de PE).
-- Revalidación obligatoria si `enqueued_at` > 1h.
-- Imagen, precio y URL obligatorios al publicar.
-- Cada intento queda registrado en `published_messages`.
-- **Hibernación**: si el scheduler dice que no es horario activo, el
-  dispatcher se queda dormido sin publicar (ni siquiera errores de precio:
-  la gente está dormida y publicar a las 3 AM no aporta valor).
-"""
+"""Serialized outbox dispatcher."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Protocol
 
-from ..models import OutboxItem, OutboxState, OutboxType
+from ..db import execute_with_retry, is_locked_error
+from ..models import OutboxItem, OutboxType
+from ..publishing.whatsapp_publisher import PublishOutcome, WhatsAppPublisher
 from ..runtime.scheduler import OperatingScheduler, ScheduleMode
 from .outbox import InMemoryOutbox
-from ..publishing.whatsapp_publisher import PublishOutcome, WhatsAppPublisher
 
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Tipos auxiliares
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RevalidationResult:
-    """Resultado de revalidar un OutboxItem antes de publicar.
-
-    El revalidator devuelve un payload nuevo y un flag `still_eligible`. Si no
-    sigue siendo elegible, el dispatcher lo descarta con la razón.
-    """
-
     still_eligible: bool
     payload: Optional[dict] = None
     discard_reason: Optional[str] = None
 
 
+@dataclass
+class TickAttemptResult:
+    outcome: Optional[PublishOutcome]
+    terminal: bool
+    attempts_used: int
+
+
 class Revalidator(Protocol):
-    """Interfaz que el dispatcher invoca cuando outbox age > 1h.
-
-    En Fase 3.1 no hay implementación real (Playwright entra en 3.3/3.4).
-    Para tests se inyecta un fake.
-    """
-
     async def revalidate(self, item: OutboxItem) -> RevalidationResult: ...
 
 
 class NullRevalidator:
-    """Revalidator por defecto: deja pasar tal cual.
-
-    Útil cuando todavía no hay marketplaces implementados (Fase 3.1).
-    El dispatcher hace por sí mismo los gates de imagen/precio/url, así que
-    no es peligroso.
-    """
-
     async def revalidate(self, item: OutboxItem) -> RevalidationResult:
         return RevalidationResult(still_eligible=True, payload=item.message_payload)
 
 
-# ---------------------------------------------------------------------------
-# Persistencia de published_messages (opcional)
-# ---------------------------------------------------------------------------
-
-
 PublishedRecorder = Callable[[OutboxItem, PublishOutcome, datetime], Awaitable[None]]
 DuplicateChecker = Callable[[OutboxItem], bool]
-"""Callback síncrono: True si el item ya fue publicado recientemente.
-
-Usado para evitar publicar el mismo producto (mismo `item_id`/`asin`)
-múltiples veces cuando el outbox se llenó de duplicados antes del
-despacho. El dispatcher lo invoca justo antes de `publisher.publish`.
-"""
-
-
 ItemSelector = Callable[
     [InMemoryOutbox, Optional[datetime], datetime],
     Awaitable[Optional[OutboxItem]],
 ]
-"""Callback async para elegir el siguiente item del outbox.
-
-Cuando se inyecta, reemplaza a `outbox.pick_random_eligible` en
-`OutboxDispatcher.tick`. La firma coincide con `DiversityCurator.pick`
-(diversity-curator-agent §5.4): recibe `(outbox, last_normal_pub_at, now)`
-y devuelve el `OutboxItem` elegido o `None` si no hay nada elegible.
-
-Si el selector lanza una excepción, el dispatcher hace fallback a
-`pick_random_eligible` para no detener publicaciones por un fallo del
-curator/LLM/db.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
 
 
 class OutboxDispatcher:
-    """Dispatcher serializado del outbox a WhatsApp."""
+    """Dispatches a single outbox item at a time."""
 
     def __init__(
         self,
@@ -139,6 +64,9 @@ class OutboxDispatcher:
         duplicate_checker: Optional[DuplicateChecker] = None,
         item_selector: Optional[ItemSelector] = None,
         idle_sleep_seconds: float = 5.0,
+        revalidation_budget_per_tick: int = 2,
+        max_attempts_per_tick: int = 10,
+        temporary_failure_retry_seconds: int = 120,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         scheduler: Optional[OperatingScheduler] = None,
     ) -> None:
@@ -149,22 +77,30 @@ class OutboxDispatcher:
         self._is_duplicate = duplicate_checker
         self._item_selector = item_selector
         self.idle_sleep_seconds = idle_sleep_seconds
+        self.revalidation_budget_per_tick = max(1, int(revalidation_budget_per_tick))
+        self.max_attempts_per_tick = max(1, int(max_attempts_per_tick))
+        self.temporary_failure_retry_seconds = max(
+            1, int(temporary_failure_retry_seconds)
+        )
         self._clock = clock
         self.scheduler = scheduler
         self._last_normal_publication_at: Optional[datetime] = None
         self._stop = asyncio.Event()
         self._publish_lock = asyncio.Lock()
         self._last_mode_logged: Optional[str] = None
-
-    # ------------------------------------------------------------------
-    # Loop público
-    # ------------------------------------------------------------------
+        selector_name = "diversity_curator" if item_selector is not None else "legacy"
+        logger.info("OutboxDispatcher configured selector=%s", selector_name)
 
     async def run_forever(self) -> None:
         logger.info("OutboxDispatcher arrancando (idle_sleep=%.1fs)", self.idle_sleep_seconds)
         try:
             while not self._stop.is_set():
-                await self.tick()
+                try:
+                    await self.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("dispatcher tick failed; continuing next cycle")
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.idle_sleep_seconds)
                 except asyncio.TimeoutError:
@@ -175,59 +111,63 @@ class OutboxDispatcher:
     async def stop(self) -> None:
         self._stop.set()
 
-    # ------------------------------------------------------------------
-    # Un ciclo
-    # ------------------------------------------------------------------
-
     async def tick(self) -> Optional[PublishOutcome]:
-        """Ejecuta un sólo ciclo: revalidación + selección + publicación.
-
-        Devuelve el `PublishOutcome` cuando se publica algo, `None` si no hay
-        nada elegible o el scheduler está hibernando.
-        """
         async with self._publish_lock:
             now = self._clock()
-
-            # Hibernación: ni siquiera revalidamos para no quemar Playwright.
             if self._is_hibernating():
                 return None
 
-            await self._revalidate_old_items(now)
+            attempted_ids: set[int] = set()
+            attempts_remaining = self.max_attempts_per_tick
+            last_soft_outcome: Optional[PublishOutcome] = None
+            needs_revalidation = self.outbox.needs_revalidation(now=now)
+            hard_revalidation_ids = {
+                item.id
+                for item in needs_revalidation
+                if (item.message_payload or {}).get("requires_live_validation") is True
+            }
 
-            if self._item_selector is not None:
-                try:
-                    picked = await self._item_selector(
-                        self.outbox, self._last_normal_publication_at, now
-                    )
-                except Exception:
-                    logger.exception(
-                        "item_selector raised — falling back to pick_random_eligible"
-                    )
-                    picked = self.outbox.pick_random_eligible(
-                        last_normal_publication_at=self._last_normal_publication_at,
-                        now=now,
-                    )
-            else:
-                picked = self.outbox.pick_random_eligible(
-                    last_normal_publication_at=self._last_normal_publication_at,
-                    now=now,
+            fresh_ids = {
+                item.id
+                for item in self.outbox.eligible_now(self._last_normal_publication_at, now)
+                if item.id not in hard_revalidation_ids
+            }
+            if fresh_ids:
+                fresh_result = await self._attempt_candidates(
+                    now,
+                    attempted_ids=attempted_ids,
+                    attempts_remaining=attempts_remaining,
+                    allowed_ids=fresh_ids,
                 )
-            if picked is None:
-                return None
+                attempts_remaining -= fresh_result.attempts_used
+                if fresh_result.terminal:
+                    return fresh_result.outcome
+                last_soft_outcome = fresh_result.outcome
 
-            return await self._publish_item(picked, now)
+            if attempts_remaining <= 0:
+                return last_soft_outcome
+
+            await self._revalidate_old_items(now)
+            post_result = await self._attempt_candidates(
+                now,
+                attempted_ids=attempted_ids,
+                attempts_remaining=attempts_remaining,
+                allowed_ids=None,
+            )
+            if post_result.terminal:
+                return post_result.outcome
+            return post_result.outcome or last_soft_outcome
 
     def _is_hibernating(self) -> bool:
         if self.scheduler is None:
             return False
         decision = self.scheduler.decide()
-        # Hibernating + warmup → ambos pausan publicación.
         is_paused = decision.mode in (ScheduleMode.HIBERNATING, ScheduleMode.WARMUP)
         if is_paused:
             current = decision.mode.value
             if self._last_mode_logged != current:
                 logger.info(
-                    "dispatcher pausado: modo=%s (próximo=%s en %s)",
+                    "dispatcher pausado: modo=%s (proximo=%s en %s)",
                     decision.mode.value,
                     decision.next_mode.value,
                     decision.next_change_in,
@@ -239,12 +179,10 @@ class OutboxDispatcher:
             self._last_mode_logged = "active"
         return is_paused
 
-    # ------------------------------------------------------------------
-    # Revalidación
-    # ------------------------------------------------------------------
-
     async def _revalidate_old_items(self, now: datetime) -> None:
-        old_items = self.outbox.needs_revalidation(now=now)
+        old_items = self.outbox.needs_revalidation(now=now)[
+            : self.revalidation_budget_per_tick
+        ]
         for item in old_items:
             logger.info(
                 "Revalidando outbox item id=%s (age %ds)",
@@ -253,27 +191,39 @@ class OutboxDispatcher:
             )
             try:
                 result = await self.revalidator.revalidate(item)
-            except Exception as exc:  # nunca dejamos morir el dispatcher
+            except Exception as exc:
                 logger.warning("revalidator error item=%s: %s", item.id, exc)
-                self.outbox.mark_discarded(item, reason=f"revalidation_error: {exc}")
+                self._safe_outbox_write(
+                    "revalidation_error_discard",
+                    item,
+                    lambda: self.outbox.mark_discarded(
+                        item, reason=f"revalidation_error: {exc}"
+                    ),
+                )
                 continue
 
             if not result.still_eligible:
                 reason = result.discard_reason or "no_longer_eligible"
-                self.outbox.mark_discarded(item, reason=reason)
-                logger.info("Outbox item id=%s descartado: %s", item.id, reason)
+                if self._safe_outbox_write(
+                    "revalidation_discard",
+                    item,
+                    lambda: self.outbox.mark_discarded(item, reason=reason),
+                ):
+                    logger.info("Outbox item id=%s descartado: %s", item.id, reason)
                 continue
 
-            if result.payload is not None and result.payload != item.message_payload:
-                self.outbox.update_after_revalidation(item, result.payload, now=now)
-
-    # ------------------------------------------------------------------
-    # Publicación
-    # ------------------------------------------------------------------
+            refreshed_payload = result.payload or item.message_payload
+            self._safe_outbox_write(
+                "revalidation_update",
+                item,
+                lambda: self.outbox.update_after_revalidation(
+                    item,
+                    refreshed_payload,
+                    now=now,
+                ),
+            )
 
     async def _publish_item(self, item: OutboxItem, now: datetime) -> PublishOutcome:
-        # Anti-duplicado: si ya publicamos recientemente el mismo
-        # item_id/asin, descartamos antes de quemar API quota.
         if self._is_duplicate is not None:
             try:
                 already = bool(self._is_duplicate(item))
@@ -282,10 +232,16 @@ class OutboxDispatcher:
                 already = False
             if already:
                 logger.info(
-                    "Publish skipped (recent_duplicate) item=%s — descartando",
+                    "Publish skipped (recent_duplicate) item=%s - descartando",
                     item.id,
                 )
-                self.outbox.mark_discarded(item, reason="recent_duplicate_dispatched")
+                self._safe_outbox_write(
+                    "duplicate_discard",
+                    item,
+                    lambda: self.outbox.mark_discarded(
+                        item, reason="recent_duplicate_dispatched"
+                    ),
+                )
                 return PublishOutcome(
                     success=False,
                     dry_run=False,
@@ -298,17 +254,18 @@ class OutboxDispatcher:
         outcome = await self.publisher.publish(item)
 
         if outcome.skipped:
-            # Publishing está deshabilitado: dejamos el item pendiente.
             logger.info(
-                "Publish skipped (publishing_disabled) item=%s — se mantiene pending",
+                "Publish skipped (publishing_disabled) item=%s - se mantiene pending",
                 item.id,
             )
             return outcome
 
-        # REGLA 6: si el publisher pidió descartar (medium-PE sin descuento),
-        # marcamos el item como discarded para que NO se reintente.
         if outcome.discard_reason is not None:
-            self.outbox.mark_discarded(item, reason=outcome.discard_reason)
+            self._safe_outbox_write(
+                "publisher_discard",
+                item,
+                lambda: self.outbox.mark_discarded(item, reason=outcome.discard_reason),
+            )
             logger.warning(
                 "Discarded outbox item=%s (publisher discard_reason=%s)",
                 item.id,
@@ -317,10 +274,6 @@ class OutboxDispatcher:
             return outcome
 
         if outcome.success:
-            # Si el item fue degradado (PE → normal), persistimos el cambio
-            # antes de marcar como SENT para que el histórico refleje el
-            # tipo final correcto y futuras analíticas lo computen como
-            # oferta normal.
             if outcome.degraded_outbox_type is not None:
                 from dataclasses import replace as _replace
 
@@ -329,20 +282,22 @@ class OutboxDispatcher:
                     type=outcome.degraded_outbox_type,
                     message_payload=outcome.degraded_payload or item.message_payload,
                 )
-                self.outbox._update(  # noqa: SLF001 — uso interno legítimo
+                self._safe_outbox_write(
+                    "degraded_update",
                     item,
-                    type=degraded.type,
-                    message_payload=degraded.message_payload,
+                    lambda: self.outbox._update(
+                        item,
+                        type=degraded.type,
+                        message_payload=degraded.message_payload,
+                    ),
                 )
                 item = degraded
-            self.outbox.mark_published(item, now=now)
-            if item.type == OutboxType.NORMAL.value and not outcome.dry_run:
-                # Cooldown sólo aplica para envíos reales: en dry-run no
-                # bloqueamos siguientes ofertas (útil para tests y staging).
-                self._last_normal_publication_at = now
-            elif item.type == OutboxType.NORMAL.value:
-                # En dry-run actualizamos también para no spamear logs si el
-                # operador lo desea. Lo mantenemos para tener cooldown realista.
+            self._safe_outbox_write(
+                "mark_published",
+                item,
+                lambda: self.outbox.mark_published(item, now=now),
+            )
+            if item.type == OutboxType.NORMAL.value:
                 self._last_normal_publication_at = now
             logger.info(
                 "Published item=%s type=%s dry_run=%s",
@@ -351,12 +306,33 @@ class OutboxDispatcher:
                 outcome.dry_run,
             )
         else:
-            self.outbox.mark_failed(item, now=now)
-            logger.warning(
-                "Publish failed item=%s error=%s",
-                item.id,
-                outcome.error,
-            )
+            if (
+                outcome.evolution_response is not None
+                and outcome.evolution_response.temporary
+            ):
+                self._safe_outbox_write(
+                    "mark_retry_later",
+                    item,
+                    lambda: self.outbox.mark_retry_later(
+                        item,
+                        now=now,
+                        delay_seconds=self.temporary_failure_retry_seconds,
+                        error=outcome.error,
+                    ),
+                )
+                logger.warning(
+                    "Publish temporary failure item=%s error=%s retry_in=%ss",
+                    item.id,
+                    outcome.error,
+                    self.temporary_failure_retry_seconds,
+                )
+            else:
+                self._safe_outbox_write(
+                    "mark_failed",
+                    item,
+                    lambda: self.outbox.mark_failed(item, now=now),
+                )
+                logger.warning("Publish failed item=%s error=%s", item.id, outcome.error)
 
         if self._record_published is not None:
             try:
@@ -366,9 +342,46 @@ class OutboxDispatcher:
 
         return outcome
 
-    # ------------------------------------------------------------------
-    # Hooks útiles para tests / startup
-    # ------------------------------------------------------------------
+    async def _attempt_candidates(
+        self,
+        now: datetime,
+        *,
+        attempted_ids: set[int],
+        attempts_remaining: int,
+        allowed_ids: Optional[set[int]],
+    ) -> TickAttemptResult:
+        attempts_used = 0
+        last_soft_outcome: Optional[PublishOutcome] = None
+
+        while attempts_used < attempts_remaining:
+            picked = await self._pick_candidate(
+                now,
+                excluded_ids=attempted_ids,
+                allowed_ids=allowed_ids,
+            )
+            if picked is None:
+                break
+            attempted_ids.add(picked.id)
+            attempts_used += 1
+            outcome = await self._publish_item(picked, now)
+            if not self._should_continue_search(outcome):
+                return TickAttemptResult(
+                    outcome=outcome,
+                    terminal=True,
+                    attempts_used=attempts_used,
+                )
+            last_soft_outcome = outcome
+
+        if attempts_used >= attempts_remaining and last_soft_outcome is not None:
+            logger.warning(
+                "dispatcher agotó max_attempts_per_tick=%s sin publish exitoso",
+                self.max_attempts_per_tick,
+            )
+        return TickAttemptResult(
+            outcome=last_soft_outcome,
+            terminal=False,
+            attempts_used=attempts_used,
+        )
 
     def reset_cooldown(self) -> None:
         self._last_normal_publication_at = None
@@ -376,21 +389,114 @@ class OutboxDispatcher:
     def set_last_normal_publication(self, when: Optional[datetime]) -> None:
         self._last_normal_publication_at = when
 
+    async def _pick_candidate(
+        self,
+        now: datetime,
+        *,
+        excluded_ids: Optional[set[int]] = None,
+        allowed_ids: Optional[set[int]] = None,
+    ) -> Optional[OutboxItem]:
+        candidate_pool = _CandidatePoolView(
+            self.outbox,
+            excluded_ids=excluded_ids,
+            allowed_ids=allowed_ids,
+        )
+        if self._item_selector is not None:
+            try:
+                return await self._item_selector(
+                    candidate_pool,
+                    self._last_normal_publication_at,
+                    now,
+                )
+            except Exception:
+                logger.exception(
+                    "DiversityCurator failed, falling back to legacy selector (item_selector)"
+                )
+        return candidate_pool.pick_random_eligible(
+            last_normal_publication_at=self._last_normal_publication_at,
+            now=now,
+        )
 
-# ---------------------------------------------------------------------------
-# Recorder simple a SQLite (opcional, usado por el orchestrator)
-# ---------------------------------------------------------------------------
+    def _should_continue_search(self, outcome: PublishOutcome) -> bool:
+        if outcome.success:
+            return False
+        if outcome.skipped:
+            return outcome.skip_reason == "recent_duplicate"
+        if outcome.discard_reason is not None:
+            return True
+        if outcome.evolution_response is not None:
+            return False
+        if outcome.error == "target_group_id_unset":
+            return False
+        return True
+
+    def _safe_outbox_write(
+        self,
+        action: str,
+        item: OutboxItem,
+        operation: Callable[[], object],
+    ) -> bool:
+        try:
+            operation()
+            return True
+        except sqlite3.OperationalError as exc:
+            if is_locked_error(exc):
+                logger.warning("outbox write lock action=%s item=%s: %s", action, item.id, exc)
+                return False
+            logger.exception("outbox write failed action=%s item=%s", action, item.id)
+            return False
+        except Exception:
+            logger.exception("outbox write failed action=%s item=%s", action, item.id)
+            return False
+
+
+class _CandidatePoolView:
+    def __init__(
+        self,
+        outbox: InMemoryOutbox,
+        *,
+        excluded_ids: Optional[set[int]] = None,
+        allowed_ids: Optional[set[int]] = None,
+    ) -> None:
+        self._outbox = outbox
+        self._excluded_ids = excluded_ids or set()
+        self._allowed_ids = allowed_ids
+        self._rng = getattr(outbox, "_rng", None)
+
+    def eligible_now(
+        self,
+        last_normal_publication_at: Optional[datetime],
+        now: Optional[datetime] = None,
+    ) -> list[OutboxItem]:
+        base = self._outbox.eligible_now(last_normal_publication_at, now)
+        return [
+            item
+            for item in base
+            if item.id not in self._excluded_ids
+            and (self._allowed_ids is None or item.id in self._allowed_ids)
+        ]
+
+    def pick_random_eligible(
+        self,
+        last_normal_publication_at: Optional[datetime],
+        now: Optional[datetime] = None,
+    ) -> Optional[OutboxItem]:
+        eligible = self.eligible_now(last_normal_publication_at, now)
+        if not eligible:
+            return None
+        price_errors = [
+            item
+            for item in eligible
+            if item.type in (OutboxType.PRICE_ERROR.value, OutboxType.POSSIBLE_PE.value)
+        ]
+        pool = price_errors or eligible
+        if self._rng is not None:
+            return self._rng.choice(pool)
+        return pool[0]
 
 
 def make_sqlite_published_recorder(conn) -> PublishedRecorder:
-    """Crea un recorder que persiste publishedMessages a SQLite.
-
-    `conn` es una `sqlite3.Connection`.
-    """
-
-    async def _record(
-        item: OutboxItem, outcome: PublishOutcome, when: datetime
-    ) -> None:
+    async def _record(item: OutboxItem, outcome: PublishOutcome, when: datetime) -> None:
         text = outcome.formatted.text if outcome.formatted else ""
         media_url = outcome.formatted.image_url if outcome.formatted else None
         evolution_response = (
@@ -398,41 +504,29 @@ def make_sqlite_published_recorder(conn) -> PublishedRecorder:
             if outcome.evolution_response and outcome.evolution_response.raw
             else None
         )
-        conn.execute(
+        execute_with_retry(
+            conn,
             "INSERT INTO published_messages "
             "(outbox_id, offer_id, sent_at, success, evolution_response, message_text, media_url) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 item.id,
                 item.offer_id,
-                when.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
-                    "+00:00", "Z"
-                ),
+                when.astimezone(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
                 1 if outcome.success else 0,
                 evolution_response,
                 text,
                 media_url,
             ),
+            description=f"published_messages insert outbox_id={item.id}",
         )
 
     return _record
 
 
-def make_sqlite_duplicate_checker(
-    conn, *, hours: int = 48
-) -> DuplicateChecker:
-    """Factory de ``DuplicateChecker`` que consulta SQLite.
-
-    Considera duplicado un item cuyo ``item_id`` o ``asin`` (extraído del
-    payload del outbox) ya aparece en ``published_messages`` con
-    ``success=1`` dentro de las últimas ``hours`` horas.
-
-    Esto cierra el guard que existe a nivel de hunter (al encolar) con
-    uno a nivel de dispatcher (al despachar): si el outbox ya estaba
-    lleno de duplicados antes de aplicar este check, no llegan a
-    WhatsApp.
-    """
-
+def make_sqlite_duplicate_checker(conn, *, hours: int = 48) -> DuplicateChecker:
     def _check(item: OutboxItem) -> bool:
         payload = item.message_payload or {}
         item_id = payload.get("item_id") or payload.get("asin")
@@ -442,7 +536,8 @@ def make_sqlite_duplicate_checker(
             datetime.now(timezone.utc) - timedelta(hours=hours)
         ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         try:
-            row = conn.execute(
+            row = execute_with_retry(
+                conn,
                 """
                 SELECT pm.id FROM published_messages pm
                 JOIN outbox o ON pm.outbox_id = o.id
@@ -456,41 +551,27 @@ def make_sqlite_duplicate_checker(
                 LIMIT 1
                 """,
                 (cutoff, item.id, item_id, item_id),
+                description=f"duplicate_checker item={item.id}",
             ).fetchone()
         except Exception:
-            logger.exception("duplicate_checker SQL falló")
+            logger.exception("duplicate_checker SQL fallo")
             return False
         return row is not None
 
     return _check
 
-    return _check
-
 
 def make_stale_price_checker(*, max_age_hours: int = 4) -> DuplicateChecker:
-    """Descarta items cuyo ``previous_price`` puede estar obsoleto.
-
-    Un item con ``previous_price`` que lleva más de ``max_age_hours``
-    horas en el outbox sin publicarse probablemente tiene un precio
-    anterior que ya no existe en la página (Amazon lo quitó, Hot Sale
-    terminó, etc.). Lo descartamos para no publicar descuentos falsos.
-
-    Aplica sólo a items ``type=normal`` con ``previous_price`` presente.
-    Items sin ``previous_price`` ya son rechazados por el formatter.
-    """
-
     def _check(item: OutboxItem) -> bool:
         if item.type != "normal":
             return False
         payload = item.message_payload or {}
         if payload.get("previous_price") is None:
             return False
-        # Si el item lleva más de max_age_hours desde que se encoló,
-        # el precio anterior puede estar obsoleto.
         age = datetime.now(timezone.utc) - item.enqueued_at
         if age.total_seconds() > max_age_hours * 3600:
             logger.info(
-                "stale_price_checker: item=%s age=%.1fh > %dh — descartando",
+                "stale_price_checker: item=%s age=%.1fh > %dh - descartando",
                 item.id,
                 age.total_seconds() / 3600,
                 max_age_hours,

@@ -33,7 +33,9 @@ from ..exploration.listing_extractor import (
     extract_amazon_deals,
     extract_amazon_listing,
     extract_mercadolibre_listing,
+    extract_mercadolibre_listing_items,
 )
+from ..exploration.listing_prefilter import decide_listing_item
 from ..exploration.url_classifier import classify
 from ..session.mercadolibre_session import is_login_redirect
 
@@ -71,12 +73,21 @@ class DiscoveryAgent:
         db_conn: sqlite3.Connection,
         marketplace: str,
         max_per_cycle: int = 3,
+        listing_discount_prefilter: bool = False,
+        listing_min_discount: float = 50.0,
+        listing_discount_strict: bool = False,
+        listing_unknown_discount_score: float = 1.0,
     ) -> None:
         self.browser = browser
         self.db = db_conn
         self.marketplace = marketplace
         self.max_per_cycle = max_per_cycle
         self.frontier = FrontierRepo(db_conn)
+        # Prefiltro de descuento (sólo aplica a ML; Amazon ignora estos flags).
+        self.listing_discount_prefilter = listing_discount_prefilter
+        self.listing_min_discount = listing_min_discount
+        self.listing_discount_strict = listing_discount_strict
+        self.listing_unknown_discount_score = listing_unknown_discount_score
 
     async def aclose(self) -> None:
         try:
@@ -164,6 +175,15 @@ class DiscoveryAgent:
 
         self.frontier.mark_visited(self.marketplace, item.url)
 
+        # Ruta ML con prefiltro de descuento: extraemos a nivel de tarjeta y
+        # decidimos por descuento ANTES de meter productos al frontier. Las
+        # URLs de navegación (listing/category/paginación) entran igual.
+        if (
+            self.marketplace == "mercadolibre"
+            and self.listing_discount_prefilter
+        ):
+            return self._discover_one_ml_prefiltered(item, page, final_url)
+
         discovered = self._extract_urls(item.kind, page.html, final_url)
         persisted = 0
         for info in discovered:
@@ -185,6 +205,89 @@ class DiscoveryAgent:
             kind=item.kind,
             discovered_count=len(discovered),
             persisted_count=persisted,
+        )
+
+    def _discover_one_ml_prefiltered(
+        self, item: FrontierItem, page: RenderedPage, final_url: str
+    ) -> DiscoveryOutcome:
+        """Discovery ML con prefiltro de descuento a nivel de tarjeta.
+
+        - Productos: pasan por `decide_listing_item`. Sólo entran al frontier
+          los aceptados (descuento >= umbral, o unknown según política).
+        - Navegación (listing/category/paginación): se persiste vía el
+          extractor clásico, sin filtrar por precio.
+        """
+        prod_items = extract_mercadolibre_listing_items(page.html, base_url=final_url)
+
+        accepted_discount = 0
+        accepted_unknown = 0
+        discarded_low = 0
+        discarded_unknown_strict = 0
+        persisted = 0
+
+        for li in prod_items:
+            decision = decide_listing_item(
+                li,
+                min_discount=self.listing_min_discount,
+                strict=self.listing_discount_strict,
+                unknown_score=self.listing_unknown_discount_score,
+            )
+            if decision.bucket == "accepted_discount":
+                accepted_discount += 1
+            elif decision.bucket == "accepted_unknown":
+                accepted_unknown += 1
+            elif decision.bucket == "discarded_low_discount":
+                discarded_low += 1
+            elif decision.bucket == "discarded_unknown_strict":
+                discarded_unknown_strict += 1
+
+            if decision.accept:
+                if self.frontier.add(li.url, kind="product", score=decision.score):
+                    persisted += 1
+
+        # Navegación: listings/categorías/paginación (sin filtro de precio).
+        nav_persisted = 0
+        for info in extract_mercadolibre_listing(page.html, base_url=final_url):
+            if info.kind in ("listing", "category", "deals"):
+                if self.frontier.add_classified(info):
+                    nav_persisted += 1
+
+        total_found = len(prod_items)
+        logger.info(
+            "ml_discovery %s listing_items_total=%d accepted_discount=%d "
+            "accepted_unknown=%d discarded_low_discount=%d "
+            "discarded_unknown_strict=%d nav_persisted=%d",
+            item.url,
+            total_found,
+            accepted_discount,
+            accepted_unknown,
+            discarded_low,
+            discarded_unknown_strict,
+            nav_persisted,
+        )
+        self._emit_runtime_event(
+            "ml_discovery_prefilter",
+            "info",
+            {
+                "url": item.url,
+                "listing_items_total": total_found,
+                "accepted_discount": accepted_discount,
+                "accepted_unknown": accepted_unknown,
+                "discarded_low_discount": discarded_low,
+                "discarded_unknown_strict": discarded_unknown_strict,
+                "nav_persisted": nav_persisted,
+                "min_discount": self.listing_min_discount,
+                "strict": self.listing_discount_strict,
+            },
+        )
+
+        return DiscoveryOutcome(
+            marketplace=self.marketplace,
+            url=item.url,
+            final_url=final_url,
+            kind=item.kind,
+            discovered_count=total_found + nav_persisted,
+            persisted_count=persisted + nav_persisted,
         )
 
     def _extract_urls(self, kind: str, html: str, base_url: str) -> list:

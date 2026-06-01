@@ -343,6 +343,24 @@ class PlaywrightBrowserWorker:
                 status=status,
             )
             if blocked:
+                recovery = await self._attempt_amazon_captcha_recovery(
+                    url=url,
+                    current_page=page,
+                )
+                if recovery is not None:
+                    if not recovery.blocked:
+                        logger.info(
+                            "Amazon captcha recovery succeeded for %s after fresh-page retry",
+                            url,
+                        )
+                        return recovery
+                    html = recovery.html
+                    status = recovery.status
+                    final_url = recovery.final_url
+                    error = recovery.error
+                    screenshot_bytes = recovery.screenshot_bytes
+                    captcha_extras = recovery.extras
+                    page = await self._get_or_create_page()
                 # Backoff exponencial post-captcha (legacy _handle_captcha):
                 # 30s → 60s → 120s → 300s (cap). Reset cuando hay éxito.
                 self._consecutive_amazon_captchas += 1
@@ -419,6 +437,77 @@ class PlaywrightBrowserWorker:
         # IMPORTANTE: ya no cerramos la page aquí. El legacy reusa la
         # misma pestaña para todas las navegaciones. Cerrar/abrir
         # constantemente es señal fuerte de automation.
+
+    async def _attempt_amazon_captcha_recovery(
+        self,
+        *,
+        url: str,
+        current_page,
+    ) -> Optional[RenderedPage]:
+        """Reintenta una vez con pestaña nueva antes de declarar captcha final.
+
+        Mitiga challenges transitorios donde Amazon responde un interstitial
+        real al primer hit pero permite la PDP al refrescar en un contexto ya
+        autenticado. No relaja el detector: sólo evita que un captcha puntual
+        derribe el ciclo cuando el segundo intento ya carga la página real.
+        """
+        if not self._is_amazon_url(url):
+            return None
+        assert self._context is not None
+
+        try:
+            try:
+                if self._page is current_page:
+                    self._page = None
+                await current_page.close()
+            except Exception:
+                pass
+
+            wait_seconds = self._captcha_retry_wait_seconds()
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+            retry_page = await self._context.new_page()
+            self._page = retry_page
+            response = await retry_page.goto(
+                url,
+                timeout=self.config.page_load_timeout_ms,
+                wait_until="domcontentloaded",
+            )
+            await retry_page.wait_for_timeout(3000)
+            html = await retry_page.content()
+            status = response.status if response is not None else 0
+            final_url = retry_page.url
+            blocked, error, captcha_extras = self._evaluate_block(
+                requested_url=url,
+                final_url=final_url,
+                html=html,
+                status=status,
+            )
+
+            screenshot_bytes: Optional[bytes] = None
+            if blocked and self.config.capture_screenshot_on_failure:
+                try:
+                    screenshot_bytes = await retry_page.screenshot(full_page=False)
+                except Exception:
+                    pass
+
+            return RenderedPage(
+                url=url,
+                final_url=final_url,
+                status=status,
+                html=html,
+                screenshot_bytes=screenshot_bytes,
+                error=error,
+                blocked=blocked,
+                extras=captcha_extras,
+            )
+        except Exception as exc:
+            logger.debug("Amazon captcha recovery retry failed for %s: %s", url, exc)
+            return None
+
+    def _captcha_retry_wait_seconds(self) -> float:
+        return random.uniform(2.0, 4.0)
 
     async def _get_or_create_page(self):
         """Devuelve la page persistente, creándola si no existe o si

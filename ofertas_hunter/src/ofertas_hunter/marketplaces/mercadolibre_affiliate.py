@@ -137,7 +137,47 @@ class PlaywrightAffiliateExtractor:
                         info.error = "share_button_not_visible"
                         return info
 
-            await btn.click()
+            # Antes de hacer click, eliminar overlays que ML pone encima
+            # (banner "Ofertas por tiempo limitado", header sticky, modal de
+            # cookies). Si no lo hacemos, Playwright reintenta el click 60+
+            # veces durante 30s mientras el banner intercepta pointer events.
+            try:
+                await page.evaluate(
+                    """() => {
+                        const candidates = [
+                            'header[role="banner"]',
+                            '[data-siteid="MLM"][role="banner"]',
+                            '.nav-header',
+                            '.cookie-consent-banner-opt-out',
+                            '.cookie-consent-banner__container',
+                            '.andes-modal__overlay',
+                        ];
+                        for (const sel of candidates) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                el.style.display = 'none';
+                                el.style.pointerEvents = 'none';
+                            }
+                        }
+                    }"""
+                )
+            except Exception:
+                # Si la página cambió o el evaluate falla, seguimos.
+                pass
+
+            # Click con timeout corto + fallback a force=True. Esto evita que
+            # Playwright entre en su loop de retry de actionability checks
+            # (60s+) cuando un overlay residual persiste.
+            try:
+                await btn.click(timeout=5000)
+            except PlaywrightTimeout:
+                logger.debug(
+                    "share_button click intercepted; retrying with force=True"
+                )
+                try:
+                    await btn.click(timeout=3000, force=True)
+                except Exception as exc_force:
+                    info.error = f"share_button_click_failed: {exc_force}"
+                    return info
 
             # Esperar modal abierto — ML puede mostrar "Generar link" o "Compartir"
             modal_opened = False

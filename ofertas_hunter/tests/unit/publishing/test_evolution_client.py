@@ -88,6 +88,7 @@ async def test_evolution_client_send_text_real_uses_post(monkeypatch):
             base_url="http://example.test:8080",
             api_key="dev-key",
             instance="mi-inst",
+            api_key_header="apikey",
             dry_run=False,
             client=session,
         )
@@ -100,6 +101,32 @@ async def test_evolution_client_send_text_real_uses_post(monkeypatch):
     assert captured["url"] == "http://example.test:8080/message/sendText/mi-inst"
     assert captured["apikey"] == "dev-key"
     assert '"number": "120363@g.us"' in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_send_text_real_uses_configured_header_name():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["custom-auth"] = request.headers.get("custom-auth")
+        captured["apikey"] = request.headers.get("apikey")
+        return httpx.Response(200, json={"key": {"id": "msg1"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as session:
+        client = EvolutionClient(
+            base_url="http://example.test:8080",
+            api_key="dev-key",
+            instance="mi-inst",
+            api_key_header="custom-auth",
+            dry_run=False,
+            client=session,
+        )
+        resp = await client.send_text("120363@g.us", "Hola")
+
+    assert resp.success is True
+    assert captured["custom-auth"] == "dev-key"
+    assert captured["apikey"] is None
 
 
 @pytest.mark.asyncio
@@ -121,6 +148,35 @@ async def test_evolution_client_send_text_real_records_failure(monkeypatch):
     assert resp.success is False
     assert resp.status_code == 401
     assert resp.error == "http_status_401"
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_connection_closed_is_temporary_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "status": 500,
+                "error": "Internal Server Error",
+                "response": {"message": ["Error: Connection Closed"]},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as session:
+        client = EvolutionClient(
+            base_url="http://example.test:8080",
+            api_key="dev-key",
+            instance="mi-inst",
+            dry_run=False,
+            client=session,
+        )
+        resp = await client.send_text("120363@g.us", "Hola")
+
+    assert resp.success is False
+    assert resp.status_code == 500
+    assert resp.error == "connection_closed"
+    assert resp.temporary is True
 
 
 @pytest.mark.asyncio
@@ -152,3 +208,50 @@ async def test_evolution_client_send_media_with_data_url():
     )
     assert resp.success is True
     assert resp.raw["payload"]["mimetype"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_send_image_uses_send_media_contract():
+    client = EvolutionClient(
+        base_url="http://x",
+        api_key="k",
+        instance="i",
+        dry_run=True,
+    )
+    resp = await client.send_image(
+        "5218338498692",
+        "https://example.test/image.jpg",
+        "caption",
+    )
+    assert resp.success is True
+    assert resp.raw["payload"]["number"] == "5218338498692"
+    assert resp.raw["payload"]["mediatype"] == "image"
+    assert resp.raw["payload"]["caption"] == "caption"
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_connection_state_reads_open():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        captured["apikey"] = request.headers.get("apikey")
+        return httpx.Response(200, json={"instance": {"state": "open"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as session:
+        client = EvolutionClient(
+            base_url="http://example.test:8080",
+            api_key="dev-key",
+            instance="mi-inst",
+            api_key_header="apikey",
+            dry_run=False,
+            client=session,
+        )
+        state = await client.connection_state()
+
+    assert state == "open"
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://example.test:8080/instance/connectionState/mi-inst"
+    assert captured["apikey"] == "dev-key"

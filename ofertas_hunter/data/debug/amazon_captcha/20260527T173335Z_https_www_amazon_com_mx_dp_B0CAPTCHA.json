@@ -1,0 +1,10 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0CAPTCHA",
+  "final_url": "https://www.amazon.com.mx/dp/B0CAPTCHA",
+  "status": 503,
+  "duration_ms": null,
+  "blocked": true,
+  "error": "captcha_detected",
+  "captcha_assessment": {},
+  "captured_at": "2026-05-27T17:33:35.627Z"
+}

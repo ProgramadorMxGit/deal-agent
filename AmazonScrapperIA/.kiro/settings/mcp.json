@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "amazon-scraper": {
+      "command": "py",
+      "args": ["C:\\Users\\Programador Mx\\Documents\\AmazonScrapperIA\\mcp_server.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "search_amazon",
+        "get_product_details",
+        "save_offer",
+        "get_offers_report",
+        "get_search_suggestions",
+        "analyze_page_html"
+      ]
+    }
+  }
+}

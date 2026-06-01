@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -11,6 +14,9 @@ import pytest
 
 from ofertas_hunter.config import Settings
 from ofertas_hunter.db import connect, init_db
+from ofertas_hunter.dispatching.cooldown import CooldownPolicy
+from ofertas_hunter.dispatching.outbox import OutboxConfig, SqliteOutbox
+from ofertas_hunter.models import OutboxItem, OutboxType
 from ofertas_hunter.orchestrator import (
     AgentFactoryBuilder,
     AgentFactoryFn,
@@ -83,6 +89,60 @@ def _settings(**overrides) -> Settings:
 
 def _config(**overrides) -> OrchestratorConfig:
     return OrchestratorConfig(once=True, **overrides)
+
+
+def _seed_offer_graph(conn) -> int:
+    conn.execute(
+        """
+        INSERT INTO products(
+            marketplace, url_canonical, title, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "amazon",
+            "https://example.com/p",
+            "Producto",
+            "2026-05-25T12:00:00.000Z",
+            "2026-05-25T12:00:00.000Z",
+        ),
+    )
+    product_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    conn.execute(
+        """
+        INSERT INTO price_observations(
+            product_id, current_price, previous_price, source, raw_signals_json, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            product_id,
+            100,
+            200,
+            "amazon_hunter",
+            "{}",
+            "2026-05-25T12:00:00.000Z",
+        ),
+    )
+    price_obs_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    conn.execute(
+        """
+        INSERT INTO offers(
+            product_id, current_price_observation_id, classification, score,
+            reasons_json, discount_percent, state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            product_id,
+            price_obs_id,
+            "normal_offer",
+            90,
+            "[]",
+            50,
+            "eligible",
+            "2026-05-25T12:00:00.000Z",
+            "2026-05-25T12:00:00.000Z",
+        ),
+    )
+    return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -265,4 +325,97 @@ async def test_orchestrator_records_agent_runs_for_each_cycle(tmp_path: Path):
     # Todos terminaron ok (es --once con factories triviales).
     statuses = {r["status"] for r in rows}
     assert statuses == {"ok"}
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_factory_lazy_revalidator_uses_builder_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "x.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    settings = _settings(
+        publishing_enabled=False,
+        publishing_dry_run=True,
+    )
+    config = _config(dispatcher_loop_interval=0.01)
+
+    outbox = SqliteOutbox(
+        conn,
+        OutboxConfig(
+            revalidate_age_seconds=3600,
+            cooldown=CooldownPolicy(cooldown_seconds=300),
+        ),
+    )
+    offer_id = _seed_offer_graph(conn)
+    outbox.enqueue(
+        OutboxItem(
+            offer_id=offer_id,
+            type=OutboxType.NORMAL.value,
+            enqueued_at=datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc),
+            message_payload={
+                "title": "Producto viejo",
+                "url": "https://amzn.to/x",
+                "image_url": "https://img/x.jpg",
+                "current_price": 100,
+                "previous_price": 200,
+                "discount_percent": 50,
+                "requires_live_validation": True,
+            },
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeBrowserConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeBrowserWorker:
+        def __init__(self, config):
+            self.config = config
+
+        async def _ensure_started(self):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class FakeRevalidator:
+        def __init__(self, *, browser, db_conn):
+            captured["browser"] = browser
+            captured["db_conn"] = db_conn
+
+        async def revalidate(self, item):
+            from ofertas_hunter.dispatching.dispatcher import RevalidationResult
+
+            return RevalidationResult(still_eligible=True, payload=item.message_payload)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ofertas_hunter.browser.browser_context",
+        types.SimpleNamespace(BrowserConfig=FakeBrowserConfig),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ofertas_hunter.browser.playwright_worker",
+        types.SimpleNamespace(PlaywrightBrowserWorker=FakeBrowserWorker),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ofertas_hunter.revalidation.playwright_revalidator",
+        types.SimpleNamespace(PlaywrightRevalidator=FakeRevalidator),
+    )
+
+    builder = AgentFactoryBuilder(conn, settings, config)
+    registry = AgentRunRegistry(conn)
+    handle = registry.start("outbox_dispatcher")
+
+    factory = builder.make_dispatcher_factory()
+    await factory(handle, registry)
+
+    assert captured["db_conn"] is conn
     conn.close()

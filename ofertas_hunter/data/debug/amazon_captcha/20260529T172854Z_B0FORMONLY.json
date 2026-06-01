@@ -1,0 +1,24 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0FORMONLY",
+  "final_url": "https://www.amazon.com.mx/dp/B0FORMONLY",
+  "status": 200,
+  "duration_ms": null,
+  "blocked": false,
+  "error": null,
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "medium",
+    "strong_signals": [
+      "form_action_validate_captcha"
+    ],
+    "visible_signals": [],
+    "weak_signals": [
+      "validateCaptcha"
+    ],
+    "should_pause_marketplace": false,
+    "reasons": [
+      "form_action_validate_captcha"
+    ]
+  },
+  "captured_at": "2026-05-29T17:28:54.736Z"
+}

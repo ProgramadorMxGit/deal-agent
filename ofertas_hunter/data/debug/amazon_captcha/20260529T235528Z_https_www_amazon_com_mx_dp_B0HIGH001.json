@@ -1,0 +1,23 @@
+{
+  "url": "https://www.amazon.com.mx/dp/B0HIGH001",
+  "final_url": "https://www.amazon.com.mx/dp/B0HIGH001",
+  "status": 200,
+  "duration_ms": null,
+  "blocked": true,
+  "error": "captcha_detected",
+  "captcha_assessment": {
+    "is_captcha": true,
+    "confidence": "high",
+    "strong_signals": [
+      "form_action_validate_captcha"
+    ],
+    "visible_signals": [
+      "text_continuar_comprando"
+    ],
+    "weak_signals": [
+      "validateCaptcha"
+    ],
+    "should_pause_marketplace": true
+  },
+  "captured_at": "2026-05-29T23:55:28.874Z"
+}

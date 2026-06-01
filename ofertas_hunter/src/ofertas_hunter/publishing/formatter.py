@@ -152,11 +152,34 @@ def format_normal_offer(
         raise FormatterError("title is required")
     if discount_percent is None:
         raise FormatterError("discount_percent is required")
+    if previous_price is None or float(previous_price) <= 0:
+        raise FormatterError("previous_price is required and must be > 0")
+    if current_price is None or float(current_price) <= 0:
+        raise FormatterError("current_price is required and must be > 0")
+    if float(current_price) >= float(previous_price):
+        raise FormatterError(
+            f"current_price ({current_price}) must be < previous_price ({previous_price})"
+        )
 
     title_clean = title.strip()
     image = _validate_image(image_url)
     link = _validate_url(url)
-    discount_int = int(round(float(discount_percent)))
+
+    # Coherencia precio↔descuento: recalculamos el descuento real desde los
+    # precios y, si difiere más de 3 puntos del reportado, usamos el real.
+    # Esto evita publicar mensajes tipo "67% de descuento" cuando el bajón
+    # real es del 13% (extracción mal del precio anterior).
+    real_discount = (
+        (float(previous_price) - float(current_price)) / float(previous_price) * 100.0
+    )
+    requested = float(discount_percent)
+    if abs(real_discount - requested) > 3.0:
+        # Honramos el dato matemáticamente correcto. Esto silencia el
+        # mensaje pero mantiene al usuario protegido.
+        discount_int = int(round(real_discount))
+    else:
+        discount_int = int(round(requested))
+
     current = _format_price(current_price)
     previous = _format_price(previous_price)
 

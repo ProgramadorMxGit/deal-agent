@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import logging
+import sqlite3
 from typing import Optional
 
 import pytest
@@ -73,6 +75,8 @@ def _make_dispatcher(
     revalidator: Optional[Revalidator] = None,
     cooldown_seconds: int = 300,
     revalidate_age_seconds: int = 3600,
+    revalidation_budget_per_tick: int = 2,
+    max_attempts_per_tick: int = 10,
     clock=None,
 ) -> tuple[OutboxDispatcher, InMemoryOutbox]:
     outbox = InMemoryOutbox(
@@ -89,6 +93,8 @@ def _make_dispatcher(
         outbox=outbox,
         publisher=publisher,
         revalidator=revalidator or NullRevalidator(),
+        revalidation_budget_per_tick=revalidation_budget_per_tick,
+        max_attempts_per_tick=max_attempts_per_tick,
         clock=clock or (lambda: T0),
     )
     return dispatcher, outbox
@@ -201,8 +207,8 @@ async def test_dispatcher_price_error_bypasses_cooldown():
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_revalidates_offer_older_than_one_hour():
-    """Ofertas con > 1h en outbox pasan por revalidator antes de publicar."""
+async def test_dispatcher_revalidates_required_live_validation_before_publish():
+    """Items requires_live_validation pasan por revalidator antes de publicar."""
     revalidator_calls: list[int] = []
 
     class TrackingRevalidator:
@@ -211,6 +217,7 @@ async def test_dispatcher_revalidates_offer_older_than_one_hour():
             new_payload = dict(item.message_payload)
             new_payload["current_price"] = 350  # cambia el precio
             new_payload["discount_percent"] = 61
+            new_payload["requires_live_validation"] = False
             return RevalidationResult(still_eligible=True, payload=new_payload)
 
     dispatcher, outbox = _make_dispatcher(
@@ -221,7 +228,8 @@ async def test_dispatcher_revalidates_offer_older_than_one_hour():
         outbox,
         OutboxType.NORMAL.value,
         offer_id=1,
-        enqueued_at=T0,  # 2 horas viejo según el clock
+        enqueued_at=T0,
+        payload={**_normal_payload(), "requires_live_validation": True},
     )
 
     outcome = await dispatcher.tick()
@@ -230,6 +238,101 @@ async def test_dispatcher_revalidates_offer_older_than_one_hour():
     assert outcome is not None and outcome.success is True
     # El payload nuevo se aplicó y se ve reflejado en el mensaje formateado.
     assert "AHORA: $350" in outcome.formatted.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_limits_revalidation_work_per_tick_and_still_publishes():
+    revalidator_calls: list[int] = []
+
+    class TrackingRevalidator:
+        async def revalidate(self, item):
+            revalidator_calls.append(item.id)
+            payload = dict(item.message_payload)
+            payload["requires_live_validation"] = False
+            return RevalidationResult(still_eligible=True, payload=payload)
+
+    dispatcher, outbox = _make_dispatcher(
+        revalidator=TrackingRevalidator(),
+        revalidate_age_seconds=3600,
+        revalidation_budget_per_tick=1,
+        clock=lambda: T0 + timedelta(hours=2),
+    )
+    _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=1,
+        enqueued_at=T0,
+        payload={**_normal_payload(), "requires_live_validation": True},
+    )
+    _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=2,
+        enqueued_at=T0,
+        payload={**_normal_payload(), "requires_live_validation": True},
+    )
+
+    outcome = await dispatcher.tick()
+
+    assert len(revalidator_calls) == 1
+    assert outcome is not None and outcome.success is True
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_prioritizes_fresh_eligible_item_before_stale_revalidation():
+    revalidator_calls: list[int] = []
+
+    class TrackingRevalidator:
+        async def revalidate(self, item):
+            revalidator_calls.append(item.id)
+            return RevalidationResult(still_eligible=True, payload=item.message_payload)
+
+    dispatcher, outbox = _make_dispatcher(
+        revalidator=TrackingRevalidator(),
+        revalidate_age_seconds=3600,
+        clock=lambda: T0 + timedelta(hours=2),
+    )
+    _enqueue(outbox, OutboxType.NORMAL.value, offer_id=1, enqueued_at=T0)
+    _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=2,
+        enqueued_at=T0 + timedelta(hours=2),
+    )
+
+    outcome = await dispatcher.tick()
+
+    assert outcome is not None and outcome.success is True
+    assert revalidator_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_publishes_stale_non_live_item_without_blocking_on_revalidation():
+    revalidator_calls: list[int] = []
+
+    class TrackingRevalidator:
+        async def revalidate(self, item):
+            revalidator_calls.append(item.id)
+            return RevalidationResult(still_eligible=True, payload=item.message_payload)
+
+    dispatcher, outbox = _make_dispatcher(
+        revalidator=TrackingRevalidator(),
+        revalidate_age_seconds=3600,
+        clock=lambda: T0 + timedelta(hours=2),
+    )
+    item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=1,
+        enqueued_at=T0,
+        payload={**_normal_payload(), "requires_live_validation": False},
+    )
+
+    outcome = await dispatcher.tick()
+
+    assert outcome is not None and outcome.success is True
+    assert revalidator_calls == []
+    assert next(i for i in outbox if i.id == item.id).state == OutboxState.SENT.value
 
 
 @pytest.mark.asyncio
@@ -246,7 +349,13 @@ async def test_dispatcher_discards_expired_after_revalidation():
         revalidator=ExpireRevalidator(),
         clock=lambda: T0 + timedelta(hours=2),
     )
-    item = _enqueue(outbox, OutboxType.NORMAL.value, offer_id=1, enqueued_at=T0)
+    item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=1,
+        enqueued_at=T0,
+        payload={**_normal_payload(), "requires_live_validation": True},
+    )
 
     outcome = await dispatcher.tick()
 
@@ -295,6 +404,51 @@ async def test_dispatcher_records_evolution_api_failure():
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_requeues_temporary_evolution_failure_with_backoff():
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "status": 500,
+                "error": "Internal Server Error",
+                "response": {"message": ["Error: Connection Closed"]},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as session:
+        evo = EvolutionClient(
+            base_url="http://x:8080",
+            api_key="k",
+            instance="i",
+            dry_run=False,
+            client=session,
+        )
+        publisher = WhatsAppPublisher(
+            client=evo, target_group_id="120363@g.us", enabled=True
+        )
+        outbox = InMemoryOutbox(OutboxConfig(cooldown=CooldownPolicy(0)))
+        dispatcher = OutboxDispatcher(outbox=outbox, publisher=publisher, clock=lambda: T0)
+
+        item = _enqueue(outbox, OutboxType.NORMAL.value)
+        outcome = await dispatcher.tick()
+
+    assert outcome is not None
+    assert outcome.success is False
+    assert outcome.evolution_response is not None
+    assert outcome.evolution_response.temporary is True
+
+    persisted = next(i for i in outbox if i.id == item.id)
+    assert persisted.state == OutboxState.PENDING.value
+    assert persisted.attempts == 1
+    assert persisted.last_attempt_at == T0
+    assert persisted.scheduled_for is not None
+    assert persisted.scheduled_for > T0
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_random_selects_among_eligible_normal_offers():
     """Con varias ofertas normales elegibles, el dispatcher las elige aleatoriamente."""
     times = [T0]
@@ -339,6 +493,75 @@ async def test_dispatcher_publishing_disabled_keeps_item_pending():
 
     persisted = next(i for i in outbox if i.id == item.id)
     assert persisted.state == OutboxState.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_logs_and_falls_back_when_item_selector_fails(caplog: pytest.LogCaptureFixture):
+    dispatcher, outbox = _make_dispatcher()
+    _enqueue(outbox, OutboxType.NORMAL.value)
+
+    async def broken_selector(*args, **kwargs):
+        raise RuntimeError("curator boom")
+
+    dispatcher._item_selector = broken_selector  # noqa: SLF001 - test hook
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await dispatcher.tick()
+
+    assert outcome is not None
+    assert outcome.success is True
+    assert "DiversityCurator failed, falling back to legacy selector" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_survives_database_lock_during_revalidation_update(
+    caplog: pytest.LogCaptureFixture,
+):
+    class LockingOutbox(InMemoryOutbox):
+        def mark_discarded(self, item, reason):
+            raise sqlite3.OperationalError("database is locked")
+
+    class ExpireRevalidator:
+        async def revalidate(self, item):
+            return RevalidationResult(
+                still_eligible=False,
+                discard_reason="discount_below_50",
+            )
+
+    outbox = LockingOutbox()
+    item = OutboxItem(
+        offer_id=1,
+        type=OutboxType.NORMAL.value,
+        enqueued_at=T0 - timedelta(hours=2),
+        message_payload={
+            **_normal_payload(),
+            "requires_live_validation": True,
+        },
+    )
+    outbox.enqueue(item)
+    client = EvolutionClient(
+        base_url="http://x:8080",
+        api_key="k",
+        instance="i",
+        dry_run=True,
+    )
+    publisher = WhatsAppPublisher(
+        client=client,
+        target_group_id="120363@g.us",
+        enabled=True,
+    )
+    dispatcher = OutboxDispatcher(
+        outbox=outbox,
+        publisher=publisher,
+        revalidator=ExpireRevalidator(),
+        clock=lambda: T0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await dispatcher.tick()
+
+    assert outcome is None
+    assert "database is locked" in caplog.text
 
 
 
@@ -430,3 +653,196 @@ async def test_dispatcher_no_scheduler_means_always_active():
     outcome = await dispatcher.tick()
     assert outcome is not None
     assert outcome.success is True
+
+
+
+# ---------------------------------------------------------------------------
+# Anti-duplicados a nivel dispatcher
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_skips_duplicate_via_checker(monkeypatch):
+    """El duplicate_checker descarta items ya publicados antes de
+    invocar al publisher.
+    """
+    from datetime import datetime, timezone
+
+    from ofertas_hunter.dispatching.dispatcher import OutboxDispatcher
+    from ofertas_hunter.dispatching.outbox import (
+        InMemoryOutbox,
+        OutboxConfig,
+    )
+    from ofertas_hunter.dispatching.cooldown import CooldownPolicy
+    from ofertas_hunter.models import OutboxItem, OutboxState, OutboxType
+
+    outbox = InMemoryOutbox(OutboxConfig(cooldown=CooldownPolicy(0)))
+    item = outbox.enqueue(
+        OutboxItem(
+            offer_id=1,
+            type=OutboxType.NORMAL.value,
+            enqueued_at=datetime.now(timezone.utc),
+            attempts=0,
+            state=OutboxState.PENDING.value,
+            message_payload={"item_id": "MLM999", "url": "https://x", "image_url": "i"},
+        )
+    )
+
+    publish_calls: list = []
+
+    class DummyPublisher:
+        async def publish(self, item):
+            publish_calls.append(item.id)
+            from ofertas_hunter.publishing.whatsapp_publisher import (
+                PublishOutcome,
+            )
+
+            return PublishOutcome(
+                success=True,
+                dry_run=False,
+                formatted=None,
+                evolution_response=None,
+            )
+
+    def is_dup(item):
+        return item.message_payload.get("item_id") == "MLM999"
+
+    dispatcher = OutboxDispatcher(
+        outbox=outbox,
+        publisher=DummyPublisher(),
+        duplicate_checker=is_dup,
+    )
+
+    outcome = await dispatcher.tick()
+    assert outcome is not None
+    assert outcome.skipped
+    assert outcome.skip_reason == "recent_duplicate"
+    # publisher NO fue invocado
+    assert publish_calls == []
+    # outbox marcado como discarded
+    refreshed = next(i for i in outbox._items if i.id == item.id)  # noqa: SLF001
+    assert refreshed.state == OutboxState.DISCARDED.value
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_continues_same_tick_after_duplicate_discard():
+    dispatcher, outbox = _make_dispatcher(cooldown_seconds=0)
+    duplicate_item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=1,
+        payload={**_normal_payload(), "asin": "DUP-1", "title": "Duplicado"},
+    )
+    publishable_item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=2,
+        payload={**_normal_payload(), "asin": "OK-2", "title": "Publicable"},
+    )
+
+    def is_dup(item):
+        return (item.message_payload or {}).get("asin") == "DUP-1"
+
+    dispatcher._is_duplicate = is_dup  # noqa: SLF001 - test hook
+
+    async def ordered_selector(pool, _last_normal_publication_at, now):
+        eligible = pool.eligible_now(None, now)
+        return eligible[0] if eligible else None
+
+    dispatcher._item_selector = ordered_selector  # noqa: SLF001 - test hook
+
+    outcome = await dispatcher.tick()
+
+    assert outcome is not None
+    assert outcome.success is True
+    persisted = {item.id: item for item in outbox}
+    assert persisted[duplicate_item.id].state == OutboxState.DISCARDED.value
+    assert persisted[publishable_item.id].state == OutboxState.SENT.value
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_continues_same_tick_after_item_local_failure():
+    dispatcher, outbox = _make_dispatcher(cooldown_seconds=0)
+    bad_payload = _normal_payload()
+    bad_payload["image_url"] = ""
+    bad_item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=1,
+        payload=bad_payload,
+    )
+    good_item = _enqueue(
+        outbox,
+        OutboxType.NORMAL.value,
+        offer_id=2,
+        payload={**_normal_payload(), "asin": "OK-LOCAL", "title": "Oferta válida"},
+    )
+
+    async def ordered_selector(pool, _last_normal_publication_at, now):
+        eligible = pool.eligible_now(None, now)
+        return eligible[0] if eligible else None
+
+    dispatcher._item_selector = ordered_selector  # noqa: SLF001 - test hook
+
+    outcome = await dispatcher.tick()
+
+    assert outcome is not None
+    assert outcome.success is True
+    persisted = {item.id: item for item in outbox}
+    assert persisted[bad_item.id].state == OutboxState.FAILED.value
+    assert persisted[good_item.id].state == OutboxState.SENT.value
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stops_same_tick_on_global_publish_failure():
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as session:
+        evo = EvolutionClient(
+            base_url="http://x:8080",
+            api_key="k",
+            instance="i",
+            dry_run=False,
+            client=session,
+        )
+        publisher = WhatsAppPublisher(
+            client=evo, target_group_id="120363@g.us", enabled=True
+        )
+        outbox = InMemoryOutbox(OutboxConfig(cooldown=CooldownPolicy(0)))
+        dispatcher = OutboxDispatcher(
+            outbox=outbox,
+            publisher=publisher,
+            max_attempts_per_tick=5,
+            clock=lambda: T0,
+        )
+
+        first = _enqueue(
+            outbox,
+            OutboxType.NORMAL.value,
+            offer_id=1,
+            payload={**_normal_payload(), "asin": "HTTP-1", "title": "HTTP fail"},
+        )
+        second = _enqueue(
+            outbox,
+            OutboxType.NORMAL.value,
+            offer_id=2,
+            payload={**_normal_payload(), "asin": "HTTP-2", "title": "No debe intentarse"},
+        )
+
+        async def ordered_selector(pool, _last_normal_publication_at, now):
+            eligible = pool.eligible_now(None, now)
+            return eligible[0] if eligible else None
+
+        dispatcher._item_selector = ordered_selector  # noqa: SLF001 - test hook
+
+        outcome = await dispatcher.tick()
+
+    assert outcome is not None
+    assert outcome.success is False
+    persisted = {item.id: item for item in outbox}
+    assert persisted[first.id].state == OutboxState.FAILED.value
+    assert persisted[second.id].state == OutboxState.PENDING.value

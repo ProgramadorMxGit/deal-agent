@@ -186,7 +186,7 @@ class CookieStore:
         if not self.path.exists():
             return [], CookieHealth(path=self.path, is_missing=True, is_empty=True)
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             return [], CookieHealth(
                 path=self.path, is_missing=True, is_empty=True, error=str(exc)

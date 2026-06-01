@@ -44,6 +44,7 @@ class FakeTelegramAdapter:
     def __init__(self, messages_by_chat: dict[int, list[IncomingMessage]]):
         self.messages = messages_by_chat
         self.connected = False
+        self.fetch_calls: list[tuple[int, int]] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -66,6 +67,7 @@ class FakeTelegramAdapter:
         return out
 
     async def fetch_history(self, chat_id: int, channel: str, limit: int):
+        self.fetch_calls.append((chat_id, limit))
         for msg in self.messages.get(chat_id, [])[:limit]:
             yield msg
 
@@ -229,6 +231,78 @@ async def test_telegram_backfill_does_not_duplicate_messages(tmp_path: Path):
     assert rows["n"] == 3
     rows = conn.execute("SELECT COUNT(*) as n FROM telegram_messages").fetchone()
     assert rows["n"] == 3
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_start_from_now_initializes_cursor_without_processing_history(tmp_path: Path):
+    db_path = tmp_path / "x.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    old_msg = _msg(-1001, 10, fixture="iphone_16_pro_max_liverpool_3899.txt")
+    adapter = FakeTelegramAdapter({-1001: [old_msg]})
+    config = _config()
+    config.target_channels = parse_channels("ofertonesmexico")
+    config.start_from_now = True
+
+    agent = TelegramListenerAgent(
+        config=config,
+        adapter=adapter,
+        db_conn=conn,
+        resolver=FakeResolver(),
+    )
+
+    first = await agent.backfill_once()
+    assert first == []
+    assert conn.execute("SELECT COUNT(*) AS n FROM telegram_messages").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM outbox").fetchone()["n"] == 0
+
+    adapter.messages[-1001] = [
+        _msg(-1001, 11, fixture="airpods_officedepot_599.txt"),
+        old_msg,
+    ]
+    second = await agent.backfill_once()
+
+    assert len(second) == 1
+    assert second[0].message.message_id == 11
+    assert second[0].outbox_id is not None
+    assert conn.execute("SELECT COUNT(*) AS n FROM telegram_messages").fetchone()["n"] == 1
+    assert conn.execute("SELECT COUNT(*) AS n FROM outbox").fetchone()["n"] == 1
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_start_from_now_bootstrap_fetches_only_latest_message(tmp_path: Path):
+    db_path = tmp_path / "x.db"
+    init_db(db_path)
+    conn = connect(db_path)
+
+    messages = [
+        _msg(-1001, message_id, fixture="iphone_16_pro_max_liverpool_3899.txt")
+        for message_id in range(20, 0, -1)
+    ]
+    adapter = FakeTelegramAdapter({-1001: messages})
+    config = _config()
+    config.target_channels = parse_channels("ofertonesmexico")
+    config.start_from_now = True
+    config.backfill_limit_per_channel = 80
+
+    agent = TelegramListenerAgent(
+        config=config,
+        adapter=adapter,
+        db_conn=conn,
+        resolver=FakeResolver(),
+    )
+
+    first = await agent.backfill_once()
+
+    assert first == []
+    assert adapter.fetch_calls == [(-1001, 1)]
+    assert conn.execute("SELECT COUNT(*) AS n FROM telegram_messages").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM outbox").fetchone()["n"] == 0
 
     conn.close()
 
