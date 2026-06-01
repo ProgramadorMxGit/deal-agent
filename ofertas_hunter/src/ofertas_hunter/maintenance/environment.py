@@ -142,6 +142,35 @@ class SystemMaintenanceEnvironment(MaintenanceEnvironment):
         rc, _ = self._run(self._systemctl("start", self.service_name), 60)
         return rc == 0
 
+    def reset_failed(self) -> bool:
+        rc, _ = self._run(self._systemctl("reset-failed", self.service_name), 15)
+        return rc == 0
+
+    def _active_state(self) -> str:
+        """Devuelve ActiveState (active|inactive|failed|activating|...) o ''."""
+        rc, out = self._run(
+            ["systemctl", "show", self.service_name, "--property=ActiveState"], 10
+        )
+        if rc != 0:
+            return ""
+        text = (out or "").strip()
+        if "=" in text:
+            return text.split("=", 1)[1].strip().lower()
+        return ""
+
+    def service_is_active(self) -> bool:
+        rc, out = self._run(["systemctl", "is-active", self.service_name], 10)
+        if (out or "").strip() == "active":
+            return True
+        # Fallback a ActiveState por si is-active no está disponible.
+        return self._active_state() == "active"
+
+    def service_is_failed(self) -> bool:
+        rc, out = self._run(["systemctl", "is-failed", self.service_name], 10)
+        if (out or "").strip() == "failed":
+            return True
+        return self._active_state() == "failed"
+
     # -- SQLite pesado ----------------------------------------------
     def quick_check(self, conn: sqlite3.Connection) -> str:
         try:

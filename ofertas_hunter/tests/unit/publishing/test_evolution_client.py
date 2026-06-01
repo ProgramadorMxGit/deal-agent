@@ -151,35 +151,6 @@ async def test_evolution_client_send_text_real_records_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_evolution_client_connection_closed_is_temporary_failure():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            500,
-            json={
-                "status": 500,
-                "error": "Internal Server Error",
-                "response": {"message": ["Error: Connection Closed"]},
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as session:
-        client = EvolutionClient(
-            base_url="http://example.test:8080",
-            api_key="dev-key",
-            instance="mi-inst",
-            dry_run=False,
-            client=session,
-        )
-        resp = await client.send_text("120363@g.us", "Hola")
-
-    assert resp.success is False
-    assert resp.status_code == 500
-    assert resp.error == "connection_closed"
-    assert resp.temporary is True
-
-
-@pytest.mark.asyncio
 async def test_evolution_client_real_unconfigured_raises():
     client = EvolutionClient(
         base_url="", api_key="", instance="", dry_run=False

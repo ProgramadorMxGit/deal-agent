@@ -333,9 +333,72 @@ async def _h_process_telegram(ctx: Any, args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+
+def _balance_pending_pool(ctx: Any) -> None:
+    """Emite pool_deficit_plan (periódico) y promueve deferred -> pending."""
+    from ...config import get_settings
+    from ...dispatching.outbox_admission import quota_config_from_settings
+    from ...dispatching.category_deficit_planner import (
+        PlannerConfig, maybe_emit_plan, promote_deferred,
+    )
+
+    s = get_settings()
+    if not getattr(s, "category_deficit_planner_enabled", True) and not getattr(
+        s, "outbox_deferred_promotion_enabled", True
+    ):
+        return
+    quota_cfg = quota_config_from_settings(s)
+    targets = tuple(
+        c.strip() for c in str(
+            getattr(s, "category_deficit_target_categories", "")
+        ).split(",") if c.strip()
+    )
+    planner_cfg = PlannerConfig(
+        enabled=bool(getattr(s, "category_deficit_planner_enabled", True)),
+        target_categories=targets or PlannerConfig().target_categories,
+        plan_every_seconds=int(getattr(s, "category_deficit_plan_every_seconds", 300)),
+    )
+    db = ctx.db
+    if getattr(s, "category_deficit_planner_enabled", True):
+        maybe_emit_plan(db, planner_cfg, quota_cfg)
+    if getattr(s, "outbox_deferred_promotion_enabled", True):
+        promote_deferred(db, quota_cfg, limit=20)
+
+    # Re-seeding periódico de seeds curadas + decay de backlog viejo.
+    try:
+        if getattr(s, "curated_seed_reseed_enabled", True):
+            from pathlib import Path as _P
+            from ...exploration.curated_reseed import reseed_curated, decay_old_backlog
+            repo_root = _P(__file__).resolve().parents[4]
+            mkts = [m.strip() for m in str(
+                getattr(s, "curated_seed_marketplaces", "amazon,mercadolibre")
+            ).split(",") if m.strip()]
+            reseed_curated(
+                db, repo_root=repo_root, marketplaces=mkts,
+                min_score=float(getattr(s, "curated_seed_min_score", 20.0)),
+                every_minutes=int(getattr(s, "curated_seed_reseed_every_minutes", 60)),
+                max_per_cycle=int(getattr(s, "curated_seed_max_per_cycle", 100)),
+            )
+            if getattr(s, "frontier_old_url_decay_enabled", True):
+                decay_old_backlog(
+                    db,
+                    decay_hours=int(getattr(s, "frontier_old_url_decay_hours", 24)),
+                    decay_factor=float(getattr(s, "frontier_old_url_decay_factor", 0.25)),
+                )
+    except Exception:
+        logger.exception("dispatch_outbox: reseed/decay falló (continuo)")
+
+
 async def _h_dispatch_outbox(ctx: Any, args: dict) -> dict:
     limit = int(args.get("limit", 1))
     results = []
+    # --- Balanceo del pending (Opción A): planner de déficit + promoción de
+    # deferred ANTES de despachar. Mantiene el despacho cada 5 min sin pausar:
+    # promueve items deferred a pending para que siempre haya material variado.
+    try:
+        _balance_pending_pool(ctx)
+    except Exception:
+        logger.exception("dispatch_outbox: balanceo de pending falló (continuo)")
     async with ctx.dispatcher_lock:
         dispatcher = ctx.get_dispatcher()
         for _ in range(max(1, min(limit, 10))):

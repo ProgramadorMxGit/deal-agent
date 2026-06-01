@@ -35,6 +35,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from ..marketplaces.base import ExtractedProduct
+from ..marketplaces.ml_price_verification import extract_verified_ml_prices
 from .price_parser import (
     calculate_discount,
     detect_monthly_payment,
@@ -321,6 +322,37 @@ class MercadoLibreProductParser:
             product.calculated_discount_percent = calc
             if product.discount_percent is None and calc:
                 product.discount_percent = calc
+
+        # --- Verificación de precio (anti falsos positivos) ---
+        # extract_verified_ml_prices NUNCA inventa previous_price; solo marca
+        # como verificado lo que viene del bloque tachado real del PDP.
+        try:
+            title_match = None
+            if expected_title and product.title:
+                title_match = _titles_match(expected_title, product.title)
+            verified = extract_verified_ml_prices(
+                soup,
+                expected_title=expected_title,
+                selected_attributes=(product.selected_variant_signals or {}),
+                has_variations=bool(product.selected_variant_signals.get("has_variations"))
+                    if product.selected_variant_signals else False,
+                title_match=title_match,
+            )
+            product.current_price_verified = verified["current_price_verified"]
+            product.ml_previous_price_verified = verified["ml_previous_price_verified"]
+            product.discount_percent_verified = verified["discount_percent_verified"]
+            product.current_price_source = verified["current_price_source"]
+            product.previous_price_source = verified["previous_price_source"]
+            product.discount_percent_source = verified["discount_percent_source"]
+            product.current_price_selector = verified["current_price_selector"]
+            product.previous_price_selector = verified["previous_price_selector"]
+            product.discount_percent_raw_text = verified["discount_percent_raw_text"]
+            product.current_price_is_unit_price = verified["current_price_is_unit_price"]
+            product.current_price_is_installment = verified["current_price_is_installment"]
+            product.ml_variant_verified = verified["ml_variant_verified"]
+            product.ml_variant_mismatch = verified["ml_variant_mismatch"]
+        except Exception:
+            logger.exception("ml verified price extraction falló (no bloqueante)")
 
         # --- Image ---
         product.image_url = (

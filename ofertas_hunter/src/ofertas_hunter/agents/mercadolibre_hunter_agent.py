@@ -201,7 +201,7 @@ class MercadoLibreHunterAgent:
         from ..exploration.frontier import FrontierRepo
 
         frontier = FrontierRepo(self.db)
-        items = frontier.pop("mercadolibre", kind="product", limit=max_urls)
+        items = self._pop_frontier_category_aware(frontier, "mercadolibre", max_urls)
         if not items:
             return []
         outcomes: list[MlHuntOutcome] = []
@@ -215,6 +215,46 @@ class MercadoLibreHunterAgent:
                 continue
             outcomes.append(outcome)
         return outcomes
+
+    def _pop_frontier_category_aware(self, frontier, marketplace, max_urls):
+        """Pop del frontier sesgado por el pool_deficit_plan (si está activo)."""
+        try:
+            from ..config import get_settings
+            s = get_settings()
+            if not getattr(s, "frontier_category_aware_enabled", True):
+                return frontier.pop(marketplace, kind="product", limit=max_urls)
+            from ..dispatching.category_deficit_planner import get_latest_plan
+            plan = get_latest_plan(self.db)
+            if not plan:
+                return frontier.pop(marketplace, kind="product", limit=max_urls)
+            deficit = plan.get("recommended_frontier_categories") or plan.get("deficit_categories")
+            saturated = plan.get("saturated_categories")
+            items = frontier.pop_category_aware(
+                marketplace, kind="product", limit=max_urls,
+                deficit_categories=deficit, saturated_categories=saturated,
+                deficit_boost=getattr(s, "frontier_deficit_boost", 2.0),
+                saturated_penalty=getattr(s, "frontier_saturated_penalty", 0.5),
+            )
+            if items:
+                from ..exploration.frontier_category import category_of_url
+                self._emit_runtime_event(
+                    kind="frontier_category_bias_applied",
+                    severity="info",
+                    payload={
+                        "deficit_categories": deficit,
+                        "saturated_categories": saturated,
+                        "selected": [
+                            {"url": it.url[:120], "category": category_of_url(it.url),
+                             "score": it.score}
+                            for it in items[:5]
+                        ],
+                        "reason": "deficit_plan_bias",
+                    },
+                )
+            return items
+        except Exception as exc:
+            logger.warning("frontier category-aware fallo (%s); pop normal", exc)
+            return frontier.pop(marketplace, kind="product", limit=max_urls)
 
     async def hunt_one(self, url: str) -> MlHuntOutcome:
         logger.info("ml_hunter fetch %s", url)
@@ -572,23 +612,46 @@ class MercadoLibreHunterAgent:
             "share_button": product.selected_variant_signals.get("share_button"),
             "source": Source.MERCADOLIBRE_HUNTER.value,
             "requires_live_validation": False,
-        }
-        cur = self.db.execute(
-            "INSERT INTO outbox (offer_id, type, enqueued_at, scheduled_for, attempts, "
-            "last_attempt_at, state, message_payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                offer_id,
-                outbox_type,
-                _now_iso(),
-                None,
-                0,
-                None,
-                OutboxState.PENDING.value,
-                json.dumps(payload, ensure_ascii=False),
+            # --- Verificación de precio (anti falsos positivos) ---
+            # Flags poblados por extract_verified_ml_prices en el parser:
+            # previous_price SOLO verificado si vino del bloque tachado real.
+            "current_price_raw_text": getattr(product, "raw_price_text", None),
+            "previous_price_raw_text": getattr(product, "raw_previous_price_text", None),
+            "discount_percent_raw_text": getattr(product, "discount_percent_raw_text", None),
+            "current_price_verified": bool(getattr(product, "current_price_verified", False)),
+            "ml_previous_price_verified": bool(getattr(product, "ml_previous_price_verified", False)),
+            "discount_percent_verified": bool(getattr(product, "discount_percent_verified", False)),
+            "current_price_source": getattr(product, "current_price_source", None),
+            "previous_price_source": getattr(product, "previous_price_source", None),
+            "discount_percent_source": getattr(product, "discount_percent_source", None),
+            "current_price_selector": getattr(product, "current_price_selector", None),
+            "previous_price_selector": getattr(product, "previous_price_selector", None),
+            "current_price_is_unit_price": bool(getattr(product, "current_price_is_unit_price", False)),
+            "current_price_is_installment": bool(
+                getattr(product, "current_price_is_installment", False)
+                or getattr(product, "is_monthly_payment", False)
             ),
+            "ml_variant_verified": bool(getattr(product, "ml_variant_verified", False)),
+            "ml_variant_mismatch": bool(
+                getattr(product, "ml_variant_mismatch", False)
+                or "variant_mismatch" in (getattr(product, "not_publishable_reasons", []) or [])
+            ),
+            "ml_previous_price_from_other_variant": bool(
+                getattr(product, "ml_previous_price_from_other_variant", False)
+            ),
+            "not_publishable_reasons": list(
+                getattr(product, "not_publishable_reasons", []) or []
+            ),
+        }
+        from ..dispatching.outbox_admission import enqueue_with_quota, load_quota_config
+        return enqueue_with_quota(
+            self.db,
+            offer_id=offer_id,
+            outbox_type=outbox_type,
+            payload=payload,
+            config=load_quota_config(),
+            now_iso_fn=_now_iso,
         )
-        return cur.lastrowid
 
     def _update_product_affiliate(
         self, product_id: int, affiliate: Optional[AffiliateInfo]

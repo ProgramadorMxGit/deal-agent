@@ -139,7 +139,11 @@ class DiscoveryAgent:
         return outcomes
 
     async def _discover_one(self, item: FrontierItem) -> DiscoveryOutcome:
-        page = await self.browser.fetch(item.url)
+        # Deal/listing/category pages cargan tarjetas de forma lazy: pedimos
+        # scroll para que el HTML traiga más product cards. Los PDPs (kind
+        # product) NO pasan por aquí, así que nunca scrolleamos un PDP.
+        scroll = item.kind in ("listing", "category", "deals")
+        page = await self._fetch_page(item.url, scroll_for_lazy_load=scroll)
         final_url = page.final_url or item.url
 
         if is_login_redirect(final_url):
@@ -289,6 +293,30 @@ class DiscoveryAgent:
             discovered_count=total_found + nav_persisted,
             persisted_count=persisted + nav_persisted,
         )
+
+    async def _fetch_page(self, url: str, *, scroll_for_lazy_load: bool = False):
+        """Fetch tolerante: si el worker no soporta el kwarg `scroll_for_lazy_load`
+        (fakes/legacy), reintenta con la firma simple. Emite
+        `deal_page_scroll_applied` cuando se solicitó scroll en un listado."""
+        try:
+            page = await self.browser.fetch(url, scroll_for_lazy_load=scroll_for_lazy_load)
+        except TypeError:
+            # Worker antiguo / fake sin el parámetro.
+            page = await self.browser.fetch(url)
+            scroll_for_lazy_load = False
+        if scroll_for_lazy_load:
+            self._emit_runtime_event(
+                "deal_page_scroll_applied",
+                "info",
+                {
+                    "marketplace": self.marketplace,
+                    "url": url,
+                    "final_url": page.final_url or url,
+                    "ok": bool(page.ok),
+                    "html_len": len(page.html or ""),
+                },
+            )
+        return page
 
     def _extract_urls(self, kind: str, html: str, base_url: str) -> list:
         if self.marketplace == "amazon":

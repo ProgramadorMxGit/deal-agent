@@ -40,3 +40,19 @@ class ExtractedProduct:
     is_monthly_payment: bool = False
     is_publishable: bool = False
     not_publishable_reasons: list[str] = field(default_factory=list)
+    # --- Verificación de precio (anti falsos positivos ML/Amazon) ---
+    current_price_verified: bool = False
+    ml_previous_price_verified: bool = False
+    discount_percent_verified: bool = False
+    current_price_source: Optional[str] = None
+    previous_price_source: Optional[str] = None
+    discount_percent_source: Optional[str] = None
+    current_price_selector: Optional[str] = None
+    previous_price_selector: Optional[str] = None
+    discount_percent_raw_text: Optional[str] = None
+    current_price_is_unit_price: bool = False
+    current_price_is_installment: bool = False
+    selected_attributes: dict = field(default_factory=dict)
+    ml_variant_verified: bool = False
+    ml_variant_mismatch: bool = False
+    ml_previous_price_from_other_variant: bool = False

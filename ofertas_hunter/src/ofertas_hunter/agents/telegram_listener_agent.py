@@ -539,22 +539,15 @@ class TelegramListenerAgent:
         )
         offer_id = cur.lastrowid
 
-        cur = self.db.execute(
-            "INSERT INTO outbox(offer_id, type, enqueued_at, scheduled_for, attempts, "
-            "last_attempt_at, state, message_payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                offer_id,
-                item.type,
-                _utcnow_iso(),
-                None,
-                0,
-                None,
-                "pending",
-                json.dumps(item.message_payload, ensure_ascii=False),
-            ),
+        from ..dispatching.outbox_admission import enqueue_with_quota, load_quota_config
+        outbox_id = enqueue_with_quota(
+            self.db,
+            offer_id=offer_id,
+            outbox_type=item.type,
+            payload=item.message_payload,
+            config=load_quota_config(),
+            now_iso_fn=_utcnow_iso,
         )
-        outbox_id = cur.lastrowid
         logger.info(
             "telegram candidate enqueued outbox_id=%s offer_id=%s type=%s score=%s",
             outbox_id,

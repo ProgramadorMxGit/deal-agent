@@ -243,14 +243,14 @@ class PlaywrightBrowserWorker:
     # Fetch
     # ------------------------------------------------------------------
 
-    async def fetch(self, url: str) -> RenderedPage:
+    async def fetch(self, url: str, *, scroll_for_lazy_load: bool = False) -> RenderedPage:
         async with self._lock:
             await self._ensure_started()
             # Si venimos de captcha, espera el backoff antes de la próxima
             # URL. Esto replica el `_handle_captcha` del legacy.
             await self._respect_captcha_backoff()
             await self._respect_rate_limit()
-            return await self._do_fetch(url)
+            return await self._do_fetch(url, scroll_for_lazy_load=scroll_for_lazy_load)
 
     async def _respect_captcha_backoff(self) -> None:
         if self._captcha_backoff_until <= 0:
@@ -273,7 +273,7 @@ class PlaywrightBrowserWorker:
             await asyncio.sleep(target_delta - elapsed)
         self._last_fetch_at = time.monotonic()
 
-    async def _do_fetch(self, url: str) -> RenderedPage:
+    async def _do_fetch(self, url: str, *, scroll_for_lazy_load: bool = False) -> RenderedPage:
         assert self._context is not None
         # Reusamos la misma page entre fetches (legacy AmazonScrapperIA).
         page = await self._get_or_create_page()
@@ -309,6 +309,21 @@ class PlaywrightBrowserWorker:
                     html = await page.content()
                 except Exception as exc:
                     logger.debug("simulate_human_browsing falló: %s", exc)
+
+            # Scroll de lazy-loading para deal/listing pages (Amazon /deals,
+            # ML /ofertas, búsquedas filtradas). El caller (DiscoveryAgent) lo
+            # pide SOLO en páginas de listado, NO en PDPs. Carga más tarjetas
+            # de producto que sólo aparecen al hacer scroll. Refresca el HTML.
+            if (
+                scroll_for_lazy_load
+                and status == 200
+                and getattr(self.config, "deal_page_scroll_enabled", True)
+            ):
+                try:
+                    await self._scroll_for_lazy_load(page)
+                    html = await page.content()
+                except Exception as exc:
+                    logger.debug("scroll_for_lazy_load falló: %s", exc)
 
             # Reintento Amazon 503 (legacy): espera 15–30s y reintenta UNA vez.
             if (
@@ -624,5 +639,80 @@ class PlaywrightBrowserWorker:
                 y = random.randint(100, max(101, vp["height"] - 100))
                 await page.mouse.move(x, y)
                 await asyncio.sleep(random.uniform(0.05, 0.2))
+        except Exception:
+            pass
+
+    async def _scroll_for_lazy_load(self, page) -> None:
+        """Scroll incremental para forzar la carga lazy de tarjetas de producto
+        en deal/listing pages (Amazon /deals, ML /ofertas, search filtrado).
+
+        A diferencia de `_simulate_human_browsing` (anti-captcha, sólo Amazon),
+        este método está pensado para listados: hace N pasos de scroll hasta el
+        fondo esperando entre cada uno a que se rendericen nuevas cards, y se
+        detiene temprano si deja de aparecer contenido nuevo o si ya hay
+        suficientes tarjetas (`deal_page_max_products`). Acotado por
+        `deal_page_timeout_seconds`. Idempotente y tolerante a fallos.
+        """
+        cfg = self.config
+        steps = max(1, int(getattr(cfg, "deal_page_scroll_steps", 4)))
+        wait_ms = max(0, int(getattr(cfg, "deal_page_scroll_wait_ms", 800)))
+        max_products = int(getattr(cfg, "deal_page_max_products", 80))
+        timeout_s = float(getattr(cfg, "deal_page_timeout_seconds", 45.0))
+
+        deadline = time.monotonic() + timeout_s
+        # Selectores de tarjeta para estimar cuántos productos hay cargados.
+        # Cubren ML (poly-card / ui-search) y Amazon (data-asin / deal grid).
+        count_js = (
+            "() => {"
+            "  const sels = ["
+            "    '[data-asin]','div.s-result-item','div.a-cardui',"
+            "    'li.ui-search-layout__item','div.poly-card','div.andes-card',"
+            "    'div.promotion-item','[class*=\"DealCard\"]'"
+            "  ];"
+            "  let max = 0;"
+            "  for (const s of sels) {"
+            "    const n = document.querySelectorAll(s).length;"
+            "    if (n > max) max = n;"
+            "  }"
+            "  return max;"
+            "}"
+        )
+
+        last_count = -1
+        stagnant = 0
+        for i in range(steps):
+            if time.monotonic() >= deadline:
+                break
+            # Scroll progresivo: fracción i+1 de la altura del documento.
+            try:
+                await page.evaluate(
+                    "(frac) => window.scrollTo(0, "
+                    "Math.ceil(document.body.scrollHeight * frac))",
+                    (i + 1) / steps,
+                )
+            except Exception:
+                break
+            # Esperar a que rendericen las nuevas cards.
+            await asyncio.sleep(wait_ms / 1000.0)
+
+            try:
+                count = await page.evaluate(count_js)
+            except Exception:
+                count = last_count
+            # Suficientes productos → parar.
+            if isinstance(count, (int, float)) and count >= max_products:
+                break
+            # Sin contenido nuevo en 2 pasos consecutivos → parar temprano.
+            if count == last_count:
+                stagnant += 1
+                if stagnant >= 2:
+                    break
+            else:
+                stagnant = 0
+            last_count = count
+
+        # Volver arriba (algunos grids re-renderizan al volver al tope).
+        try:
+            await page.evaluate("window.scrollTo(0, 0)")
         except Exception:
             pass

@@ -247,6 +247,7 @@ class ServerContext:
                 amazon_affiliate_required=self.settings.amazon_affiliate_required_for_publish,
                 amazon_min_discount_percent=self.settings.amazon_min_discount_percent,
                 amazon_extreme_discount_threshold=self.settings.amazon_extreme_discount_threshold,
+                ml_extreme_discount_threshold=getattr(self.settings, "ml_extreme_discount_threshold", 70.0),
                 amazon_min_absolute_price=self.settings.amazon_min_absolute_price,
             )
         return self._publisher

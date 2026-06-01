@@ -78,6 +78,7 @@ class OutboxState(str, Enum):
     SENT = "sent"
     FAILED = "failed"
     DISCARDED = "discarded"
+    DEFERRED = "deferred"
 
 
 # ---------------------------------------------------------------------------

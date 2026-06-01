@@ -98,6 +98,17 @@ class BrowserConfig:
     amazon_retry_on_503: bool = True
     amazon_retry_wait_range_seconds: tuple[float, float] = (15.0, 30.0)
 
+    # ----- Scroll / lazy-loading en deal/listing pages -----
+    # Las páginas de ofertas (Amazon /deals, ML /ofertas) cargan las tarjetas
+    # de producto de forma lazy al hacer scroll. Sin scroll, el HTML inicial
+    # trae pocas cards. Estos parámetros controlan el scroll incremental que
+    # el DiscoveryAgent solicita SOLO en deal/listing/category (NO en PDP).
+    deal_page_scroll_enabled: bool = True
+    deal_page_scroll_steps: int = 4
+    deal_page_scroll_wait_ms: int = 800
+    deal_page_max_products: int = 80
+    deal_page_timeout_seconds: float = 45.0
+
     # ----- Sesión persistente (login manual del operador) -----
     # Si está set, Playwright usa `launch_persistent_context` apuntando a
     # este directorio. Las cookies, localStorage, indexedDB, sesiones, etc.
@@ -138,7 +149,11 @@ class BrowserWorker(Protocol):
 
     El revalidator (y futuros hunters) usan esta interfaz; los tests inyectan
     un `FakeBrowserWorker`.
+
+    `scroll_for_lazy_load`: si True, el worker hace scroll incremental para
+    forzar la carga lazy de tarjetas de producto (deal/listing pages). Es
+    opcional para que los fakes/legacy sigan funcionando con `fetch(url)`.
     """
 
-    async def fetch(self, url: str) -> RenderedPage: ...
+    async def fetch(self, url: str, *, scroll_for_lazy_load: bool = False) -> RenderedPage: ...
     async def aclose(self) -> None: ...

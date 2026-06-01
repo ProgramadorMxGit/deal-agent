@@ -17,11 +17,12 @@ Uso:
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -109,6 +110,19 @@ def _env_float(name: str, default: float) -> float:
 # es ~720 ciclos/h; con 10s, ~360 ciclos/h. Configurable vía .env.
 ML_LOOP_SLEEP_SECONDS = _env_float("ML_LOOP_SLEEP_SECONDS", 5.0)
 
+# --- Shutdown limpio (SIGTERM/SIGINT) ---------------------------------------
+# El mantenimiento nocturno y systemd detienen el bot con una señal. Si los
+# loops no paran ni los browsers Playwright/Chromium cierran limpio antes de
+# `TimeoutStopSec`, systemd manda SIGKILL → quedan Chromium/locks huérfanos y
+# el servicio puede quedar `failed`. Estas constantes acotan el cierre.
+ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS = _env_float("ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS", 90.0)
+BROWSER_CLOSE_TIMEOUT_SECONDS = _env_float("BROWSER_CLOSE_TIMEOUT_SECONDS", 15.0)
+
+# Evento global de shutdown + flag legible por los loops.
+_shutdown_event: "asyncio.Event | None" = None
+_shutdown_requested = False
+_shutdown_signal_name: str = ""
+
 console = Console(highlight=False)
 
 # Iconos: emoji en terminales modernas, ASCII en legacy Windows
@@ -158,6 +172,34 @@ def log_ia(msg: str) -> None:
 
 def log_warn(msg: str) -> None:
     console.print(f"  [bold red]{_ICON_WARN} [WARN][/bold red] {msg}")
+
+
+def _now_iso_z() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def log_shutdown(event: str, db=None, **fields) -> None:
+    """Log estructurado del shutdown a consola y (best-effort) a runtime_events.
+
+    `event` es uno de: shutdown_started, shutdown_signal_received,
+    shutdown_stopping_loops, shutdown_cancelling_tasks, shutdown_closing_browsers,
+    shutdown_browsers_closed, shutdown_locks_released, shutdown_db_closed,
+    shutdown_done, shutdown_timeout, shutdown_browser_close_failed.
+    """
+    extra = " ".join(f"{k}={v}" for k, v in fields.items())
+    console.print(f"  [bold red]⏹  [shutdown][/bold red] {event} {extra}".rstrip())
+    if db is not None:
+        try:
+            payload = json.dumps({"event": event, **fields}, ensure_ascii=False)
+            db.execute(
+                "INSERT INTO runtime_events (kind, severity, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (event, "info", payload, _now_iso_z()),
+            )
+            db.commit()
+        except Exception:
+            # Nunca dejar que el logging rompa el shutdown.
+            pass
 
 
 async def dispatch_mcp(server, tool: str, args: dict) -> dict:
@@ -566,6 +608,48 @@ async def loop_status(server, once: bool) -> None:
             break
         except Exception:
             pass
+        # Métricas de conversión discovery→PDP→pending (throttle interno).
+        try:
+            _maybe_emit_conversion_metrics(server)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+def _maybe_emit_conversion_metrics(server) -> None:
+    """Emite discovery_conversion_summary si toca (cada N min). Best-effort."""
+    try:
+        from ofertas_hunter.config import get_settings
+        from ofertas_hunter.exploration.conversion_metrics import (
+            ConversionConfig,
+            maybe_emit_conversion,
+        )
+        s = get_settings()
+        if not getattr(s, "discovery_conversion_metrics_enabled", True):
+            return
+        db = getattr(server, "ctx", None)
+        conn = getattr(db, "db", None) if db is not None else None
+        if conn is None:
+            return
+        cfg = ConversionConfig(
+            enabled=True,
+            every_minutes=int(getattr(s, "discovery_conversion_every_minutes", 30)),
+            window_minutes=int(getattr(s, "discovery_conversion_window_minutes", 60)),
+        )
+        summaries = maybe_emit_conversion(conn, cfg)
+        if summaries:
+            for sm in summaries:
+                log_dispatch(
+                    f"[conversion] {sm['marketplace']}: deal_pages={sm['deal_pages_visited']} "
+                    f"prod_urls={sm['product_urls_extracted']} pdp={sm['pdp_visited']} "
+                    f"disc50+={sm['discount_50_plus']} pending={sm['pending_inserted']} "
+                    f"deferred={sm['deferred']} discarded={sm['discarded']}",
+                    "dim",
+                )
+    except Exception:
+        # Best-effort: nunca romper el loop de status por métricas.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +677,19 @@ async def main_async(once: bool) -> None:
             ML_LOOP_SLEEP_SECONDS = cfg_sleep
     except (TypeError, ValueError):
         pass
+
+    # Aplica configuración de shutdown limpio desde .env/Settings.
+    global ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS, BROWSER_CLOSE_TIMEOUT_SECONDS
+    try:
+        ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS = float(
+            getattr(s, "orchestrator_shutdown_timeout_seconds",
+                    ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS)
+        )
+        BROWSER_CLOSE_TIMEOUT_SECONDS = float(
+            getattr(s, "browser_close_timeout_seconds", BROWSER_CLOSE_TIMEOUT_SECONDS)
+        )
+    except (TypeError, ValueError):
+        pass
     ctx = ServerContext.build(db=conn, settings=s)
     server = MCPServer(ctx)
 
@@ -617,6 +714,24 @@ async def main_async(once: bool) -> None:
     )
     await ml_recovery.start()
 
+    # ── ML Session Health Check (Tarea 10) ───────────────────────────────
+    # Comprueba periódicamente si /ofertas abre sin login. Si requiere login,
+    # aplica backoff para no quemar ciclos ML y emite `ml_session_health`.
+    ml_health = None
+    try:
+        from ofertas_hunter.session.ml_session_health import (
+            MLHealthConfig,
+            MLSessionHealthChecker,
+        )
+        _ml_profile = getattr(s, "mercadolibre_user_data_dir", None)
+        ml_health = MLSessionHealthChecker(
+            db=conn,
+            config=MLHealthConfig.from_settings(s),
+            ml_profile_dir=Path(_ml_profile) if _ml_profile else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_warn(f"ML health check no disponible: {exc}")
+
     # Header de inicio
     console.print()
     console.print(Panel(
@@ -640,7 +755,8 @@ async def main_async(once: bool) -> None:
 
     async def loop_ml_recovery(once: bool) -> None:
         """Loop que llama a monitor.tick() cada 30s para detectar
-        cookie_expiry y avisar al admin via WhatsApp."""
+        cookie_expiry y avisar al admin via WhatsApp. También corre el
+        health check ML (con su propio throttle interno)."""
         while True:
             try:
                 result = await ml_recovery.monitor_tick()
@@ -648,32 +764,200 @@ async def main_async(once: bool) -> None:
                     log_warn("ML Recovery: cookies expiradas — aviso enviado al admin via WhatsApp")
             except Exception as exc:
                 log_warn(f"ML Recovery monitor error: {exc}")
+            # Health check ML (no bloquea; due() respeta every_minutes).
+            if ml_health is not None:
+                try:
+                    hr = await ml_health.check()
+                    if hr is not None and hr.status != "ok":
+                        log_warn(
+                            f"ML health: status={hr.status} reason={hr.reason} "
+                            f"backoff_until={hr.backoff_until}"
+                        )
+                except Exception as exc:
+                    log_warn(f"ML health check error: {exc}")
             if once:
                 break
-            await asyncio.sleep(30)
+            # Sleep interrumpible por shutdown.
+            if await _sleep_or_shutdown(30):
+                break
+
+    if once:
+        await asyncio.gather(
+            loop_amazon(server, once=True),
+            loop_ml(server, once=True),
+            loop_telegram(server, once=True),
+            loop_dispatcher(server, once=True),
+        )
+        await _graceful_cleanup(ctx, conn, ml_recovery, reason="once_complete")
+        return
+
+    # ── Modo servicio: loops infinitos + shutdown limpio por señal ──────
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
+    _install_signal_handlers(conn)
+
+    tasks = [
+        asyncio.create_task(loop_amazon(server, once=False), name="loop_amazon"),
+        asyncio.create_task(loop_ml(server, once=False), name="loop_ml"),
+        asyncio.create_task(loop_telegram(server, once=False), name="loop_telegram"),
+        asyncio.create_task(loop_dispatcher(server, once=False), name="loop_dispatcher"),
+        asyncio.create_task(loop_ia_supervision(server, once=False), name="loop_ia"),
+        asyncio.create_task(loop_status(server, once=False), name="loop_status"),
+        asyncio.create_task(loop_ml_recovery(once=False), name="loop_ml_recovery"),
+    ]
+
+    # Espera hasta que llegue una señal de shutdown O un loop muera solo.
+    shutdown_wait = asyncio.create_task(_shutdown_event.wait(), name="shutdown_wait")
+    done, pending = await asyncio.wait(
+        set(tasks) | {shutdown_wait},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if not _shutdown_requested:
+        # Un loop terminó/murió por su cuenta (no debería en modo servicio).
+        log_shutdown("shutdown_started", db=conn, reason="loop_exited_unexpectedly")
+    else:
+        log_shutdown("shutdown_started", db=conn, signal=_shutdown_signal_name)
+
+    if not shutdown_wait.done():
+        shutdown_wait.cancel()
+
+    # 1) Señalar y cancelar loops ordenadamente.
+    log_shutdown("shutdown_stopping_loops", db=conn, n_tasks=len(tasks))
+    log_shutdown("shutdown_cancelling_tasks", db=conn)
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    try:
+        await asyncio.wait(tasks, timeout=max(5.0, ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS * 0.3))
+    except Exception:
+        pass
+
+    # 2) Cleanup de browsers/locks/clients/DB con tope de tiempo global.
+    await _graceful_cleanup(ctx, conn, ml_recovery, reason=_shutdown_signal_name or "signal")
+
+
+async def _sleep_or_shutdown(seconds: float) -> bool:
+    """Duerme `seconds` salvo que llegue shutdown. Devuelve True si hay shutdown."""
+    if _shutdown_event is None:
+        await asyncio.sleep(seconds)
+        return False
+    try:
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _install_signal_handlers(conn) -> None:
+    """Instala handlers SIGTERM/SIGINT que marcan shutdown_requested."""
+    loop = asyncio.get_running_loop()
+
+    def _handler(signame: str) -> None:
+        global _shutdown_requested, _shutdown_signal_name
+        if _shutdown_requested:
+            return
+        _shutdown_requested = True
+        _shutdown_signal_name = signame
+        log_shutdown("shutdown_signal_received", db=conn, signal=signame)
+        if _shutdown_event is not None:
+            _shutdown_event.set()
+
+    for sig, name in ((signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")):
+        try:
+            loop.add_signal_handler(sig, _handler, name)
+        except (NotImplementedError, RuntimeError):
+            # Windows / entorno sin soporte: se manejará via KeyboardInterrupt.
+            pass
+
+
+async def _close_browser_with_timeout(browser, label: str, conn) -> None:
+    """Cierra un worker de browser con tope de tiempo. Idempotente y tolerante
+    a TargetClosedError / browser ya cerrado."""
+    if browser is None:
+        return
+    aclose = getattr(browser, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await asyncio.wait_for(aclose(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        log_shutdown("shutdown_browser_close_failed", db=conn, browser=label,
+                     error="timeout", timeout_s=BROWSER_CLOSE_TIMEOUT_SECONDS)
+    except Exception as exc:  # TargetClosedError u otros: no romper shutdown
+        log_shutdown("shutdown_browser_close_failed", db=conn, browser=label,
+                     error=type(exc).__name__)
+
+
+def _release_profile_locks(conn) -> None:
+    """Elimina SingletonLock/SingletonCookie/SingletonSocket de los perfiles
+    persistentes del bot (Amazon/ML), por si Chromium no los limpió. Solo toca
+    archivos DENTRO de secrets/browser_profiles/ del proyecto. NUNCA borra
+    cookies ni el perfil; solo los locks de sesión de Chromium."""
+    released = []
+    base = BOT_DIR / "secrets" / "browser_profiles"
+    for profile in ("amazon", "mercadolibre"):
+        pdir = base / profile
+        if not pdir.is_dir():
+            continue
+        for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lpath = pdir / lock
+            try:
+                if lpath.exists() or lpath.is_symlink():
+                    lpath.unlink()
+                    released.append(f"{profile}/{lock}")
+            except Exception:
+                pass
+    log_shutdown("shutdown_locks_released", db=conn, released=",".join(released) or "none")
+
+
+async def _graceful_cleanup(ctx, conn, ml_recovery, *, reason: str) -> None:
+    """Cleanup idempotente con tope de tiempo global. Cierra ml_recovery,
+    browsers, libera locks, cierra clients/DB. Nunca lanza."""
+    async def _do_cleanup() -> None:
+        # ML recovery runtime
+        try:
+            await ml_recovery.stop()
+        except Exception:
+            pass
+
+        # Browsers: cerrar individualmente con timeout (no dejar Chromium vivo).
+        log_shutdown("shutdown_closing_browsers", db=conn)
+        for attr, label in (("_amazon_browser", "amazon"),
+                            ("_ml_browser", "ml"),
+                            ("_browser", "legacy")):
+            await _close_browser_with_timeout(getattr(ctx, attr, None), label, conn)
+        # Hunters/discovery legacy con worker propio.
+        for attr, label in (("_amazon_hunter", "amazon_hunter"),
+                            ("_amazon_discovery", "amazon_discovery")):
+            obj = getattr(ctx, attr, None)
+            if obj is not None and getattr(obj, "aclose", None) is not None:
+                await _close_browser_with_timeout(obj, label, conn)
+        log_shutdown("shutdown_browsers_closed", db=conn)
+
+        # Liberar locks de perfil que Chromium pudiera dejar atrás.
+        _release_profile_locks(conn)
+
+        # Cerrar el resto del contexto (evolution client, timers de pausa, etc.)
+        # ctx.aclose vuelve a intentar cerrar browsers, pero ya son idempotentes.
+        try:
+            await asyncio.wait_for(ctx.aclose(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            pass
 
     try:
-        if once:
-            await asyncio.gather(
-                loop_amazon(server, once=True),
-                loop_ml(server, once=True),
-                loop_telegram(server, once=True),
-                loop_dispatcher(server, once=True),
-            )
-        else:
-            await asyncio.gather(
-                loop_amazon(server, once=False),
-                loop_ml(server, once=False),
-                loop_telegram(server, once=False),
-                loop_dispatcher(server, once=False),
-                loop_ia_supervision(server, once=False),
-                loop_status(server, once=False),
-                loop_ml_recovery(once=False),
-            )
-    finally:
-        await ml_recovery.stop()
-        await ctx.aclose()
+        await asyncio.wait_for(_do_cleanup(), timeout=ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        log_shutdown("shutdown_timeout", db=conn,
+                     timeout_s=ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECONDS)
+
+    # Cerrar DB al final (después de que todo dejó de escribir).
+    try:
         conn.close()
+        log_shutdown("shutdown_db_closed")
+    except Exception:
+        pass
+    log_shutdown("shutdown_done", reason=reason)
 
 
 def main() -> None:

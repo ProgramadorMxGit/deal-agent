@@ -177,6 +177,13 @@ class MaintenanceSummary:
     service_stopped: bool = False
     service_started: bool = False
     restart_done: bool = False
+    # --- robustez systemd (Task 4) ---
+    service_initial_state: Optional[str] = None
+    service_stop_result: Optional[str] = None     # "stopped" | "stop_failed" | "skipped"
+    service_start_result: Optional[str] = None    # "started" | "start_failed" | "skipped"
+    service_final_state: Optional[str] = None      # "active" | "failed" | "inactive" | "unknown"
+    reset_failed_done: bool = False
+    start_retried: bool = False
     backup_created: bool = False
     outbox_counts_before: dict = field(default_factory=dict)
     outbox_counts_after: dict = field(default_factory=dict)
@@ -271,6 +278,22 @@ class MaintenanceEnvironment:
     def integrity_check(self, conn: sqlite3.Connection) -> str: raise NotImplementedError
     def vacuum(self, conn: sqlite3.Connection) -> None: raise NotImplementedError
     def checkpoint(self, conn: sqlite3.Connection) -> None: raise NotImplementedError
+
+    # -- robustez systemd (defaults seguros para envs/fakes legacy) -----
+    def reset_failed(self) -> bool:
+        """`systemctl reset-failed` del servicio. Default no-op → True."""
+        return True
+
+    def service_is_active(self) -> bool:
+        """True si el servicio está `active`. Default: inferir del orquestador."""
+        try:
+            return self.orchestrator_running()
+        except NotImplementedError:
+            return False
+
+    def service_is_failed(self) -> bool:
+        """True si el servicio está en estado `failed`. Default: False."""
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -380,13 +403,44 @@ class NightlyMaintenanceRunner:
             return summary
 
         # 4. Detener servicio principal (acceso exclusivo para VACUUM).
+        summary.service_initial_state = self._service_state()
         if self.env.has_systemd_service() and self.env.orchestrator_running():
-            summary.service_stopped = self.env.stop_service()
+            self._emit_event("nightly_service_stop_started", {
+                "service_initial_state": summary.service_initial_state,
+            })
+            stopped = self.env.stop_service()
+            # Verificar de verdad que quedó detenido (stop_service puede
+            # devolver rc=0 pero el proceso seguir cerrando, o timeout→SIGKILL).
+            if stopped and self.env.orchestrator_running():
+                # Dar una segunda comprobación corta: el shutdown limpio puede
+                # tardar unos segundos en soltar el proceso.
+                _time.sleep(2)
+                stopped = not self.env.orchestrator_running()
+            summary.service_stopped = bool(stopped)
             if not summary.service_stopped:
+                # Stop falló o timeout: NO correr VACUUM (evita corromper con
+                # el bot aún escribiendo) y dejar el servicio recuperable.
+                summary.service_stop_result = "stop_failed"
                 summary.errors.append("stop_service_failed")
+                self._emit_event("nightly_service_stop_failed", {
+                    "service_state": self._service_state(),
+                }, severity="error")
+                self._emit_event("nightly_vacuum_skipped_service_not_stopped", {
+                    "reason": "service_stop_failed",
+                })
+                # Intentar dejar el servicio ARRIBA igualmente (no caído).
+                self._ensure_service_up(summary)
                 summary.success = False
+                summary.service_final_state = self._service_state()
+                self._emit_event("nightly_service_final_state", {
+                    "service_final_state": summary.service_final_state,
+                })
                 self._finish(summary, t0, None, emit=True)
                 return summary
+            summary.service_stop_result = "stopped"
+            self._emit_event("nightly_service_stop_done", {})
+        else:
+            summary.service_stop_result = "skipped"
 
         # 5. Confirmar que no quedan chromiums del bot.
         if self.env.bot_chromium_count() > 0:
@@ -440,15 +494,86 @@ class NightlyMaintenanceRunner:
             and not self.env.orchestrator_running()
         )
         if should_restart:
-            summary.service_started = self.env.start_service()
+            self._ensure_service_up(summary)
+            summary.service_started = (summary.service_start_result == "started")
             summary.restart_done = summary.service_started
             if not summary.service_started:
                 summary.errors.append("restart_failed")
                 summary.success = False
                 logger.error("nightly_restart_failed")
+        else:
+            summary.service_start_result = "skipped"
+
+        # Estado final del servicio (fuente de verdad para el operador).
+        summary.service_final_state = self._service_state()
+        self._emit_event("nightly_service_final_state", {
+            "service_final_state": summary.service_final_state,
+            "service_started": summary.service_started,
+            "restart_done": summary.restart_done,
+        })
+        if summary.service_final_state == "failed":
+            summary.success = False
+            if "service_final_failed" not in summary.errors:
+                summary.errors.append("service_final_failed")
 
         self._finish(summary, t0, None, emit=True)
         return summary
+
+    # ------------------------------------------------------------------
+
+    def _ensure_service_up(self, summary: MaintenanceSummary) -> None:
+        """Arranca el servicio dejándolo ARRIBA de forma robusta.
+
+        - Si el servicio quedó `failed`, hace `reset-failed` antes de `start`
+          (si no, systemd rechaza el arranque tras un stop fallido).
+        - Reintenta `start` UNA vez si el primer intento no deja el servicio
+          activo.
+        - Nunca lanza; registra eventos granulares.
+        """
+        if not self.env.has_systemd_service():
+            summary.service_start_result = "skipped"
+            return
+        if self.env.orchestrator_running():
+            summary.service_start_result = "started"
+            return
+
+        # reset-failed si está en estado failed.
+        try:
+            if self.env.service_is_failed():
+                self._emit_event("nightly_service_reset_failed", {})
+                summary.reset_failed_done = bool(self.env.reset_failed())
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._emit_event("nightly_service_start_started", {})
+        started = self.env.start_service()
+        if started and not self.env.service_is_active():
+            _time.sleep(3)
+            started = self.env.service_is_active()
+
+        if not started:
+            # Reintento único: reset-failed + start.
+            summary.start_retried = True
+            self._emit_event("nightly_service_start_retried", {})
+            try:
+                if self.env.service_is_failed():
+                    self._emit_event("nightly_service_reset_failed", {"retry": True})
+                    summary.reset_failed_done = bool(self.env.reset_failed())
+            except Exception:  # noqa: BLE001
+                pass
+            started = self.env.start_service()
+            if started and not self.env.service_is_active():
+                _time.sleep(3)
+                started = self.env.service_is_active()
+
+        if started:
+            summary.service_start_result = "started"
+            self._emit_event("nightly_service_start_done", {})
+        else:
+            summary.service_start_result = "start_failed"
+            self._emit_event("nightly_service_start_failed", {
+                "service_state": self._service_state(),
+            }, severity="error")
 
     # ------------------------------------------------------------------
 
@@ -530,6 +655,44 @@ class NightlyMaintenanceRunner:
                 conn.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("nightly: no se pudo emitir summary: %s", exc)
+
+    def _emit_event(self, kind: str, payload: dict, *, severity: str = "info") -> None:
+        """Emite un runtime_event granular del flujo de mantenimiento.
+
+        Best-effort, nunca lanza. En dry-run no escribe (cero efectos).
+        """
+        if self.dry_run:
+            return
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO runtime_events (kind, severity, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (kind, severity, json.dumps(payload, ensure_ascii=False), _iso(self._clock())),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("nightly: no se pudo emitir evento %s: %s", kind, exc)
+
+    def _service_state(self) -> str:
+        """Estado legible del servicio: active|failed|inactive|unknown."""
+        try:
+            if self.env.service_is_active():
+                return "active"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.env.service_is_failed():
+                return "failed"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return "inactive" if not self.env.orchestrator_running() else "active"
+        except Exception:  # noqa: BLE001
+            return "unknown"
 
 
 __all__ = [

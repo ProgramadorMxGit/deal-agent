@@ -55,6 +55,21 @@ _UNIT_PRICE_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Texto que delata precio por unidad de medida (kilo, gramo, litro, ml, onza)
+# o cuota/mensualidad. Usado por el gate de Mercado Libre para no tomar el
+# "precio por kilo" ($295.45/kg) ni la mensualidad como precio total.
+_ML_UNIT_PRICE_TEXT_RE = re.compile(
+    r"(/|\bpor\b)\s*"
+    r"(kilo(?:gramo)?s?|kg|gramos?|gr?\b|litros?|lt?\b|ml\b|mililitros?|"
+    r"onzas?|oz\b|unidad(?:es)?|pieza(?:s)?|pza\.?|porci[oó]n(?:es)?|c/u)",
+    re.IGNORECASE,
+)
+_ML_INSTALLMENT_TEXT_RE = re.compile(
+    r"(meses?\s+sin\s+intereses|\bMSI\b|/\s*mes\b|al\s+mes\b|"
+    r"\bcuota[s]?\b|mensualidad(?:es)?)",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Resultado
@@ -101,6 +116,7 @@ class WhatsAppPublisher:
         amazon_min_discount_percent: float = 50.0,
         amazon_extreme_discount_threshold: float = 90.0,
         amazon_min_absolute_price: float = 10.0,
+        ml_extreme_discount_threshold: float = 70.0,
     ) -> None:
         """
         Args:
@@ -122,6 +138,7 @@ class WhatsAppPublisher:
         self.amazon_min_discount_percent = amazon_min_discount_percent
         self.amazon_extreme_discount_threshold = amazon_extreme_discount_threshold
         self.amazon_min_absolute_price = amazon_min_absolute_price
+        self.ml_extreme_discount_threshold = ml_extreme_discount_threshold
 
     async def publish(self, item: OutboxItem) -> PublishOutcome:
         """Publica el item correspondiente al outbox.
@@ -155,6 +172,13 @@ class WhatsAppPublisher:
         amazon_gate = self._amazon_gate(item)
         if amazon_gate is not None:
             return amazon_gate
+
+        # Gate Mercado Libre: precio anterior verificado + anti unit-price /
+        # mensualidad / variante mismatch / descuento coherente. Mismo espíritu
+        # que el gate de Amazon. Bloquea falsos positivos de descuento ML.
+        ml_price_gate = self._ml_price_gate(item)
+        if ml_price_gate is not None:
+            return ml_price_gate
 
         # Gate ML: si es Mercado Libre y exige afiliado, validar.
         ml_gate_error = self._mercadolibre_affiliate_gate(item)
@@ -293,6 +317,86 @@ class WhatsAppPublisher:
         logger.warning(
             "publish Amazon bloqueado (id=%s): %s", item.id, reason
         )
+        return PublishOutcome(
+            success=False,
+            dry_run=self.client.dry_run,
+            formatted=None,
+            evolution_response=None,
+            error=reason,
+            discard_reason=reason,
+        )
+
+    def _ml_price_gate(self, item: OutboxItem) -> Optional[PublishOutcome]:
+        """Guardrail duro para Mercado Libre (anti falsos positivos de descuento).
+
+        Para ofertas NORMAL de ML exige:
+        - previous_price verificado (ml_previous_price_verified) y > current_price.
+        - current_price no proveniente de precio por unidad/kilo/gramo/litro.
+        - current_price no proveniente de mensualidad/cuota.
+        - sin variant_mismatch.
+        - descuento declarado coherente con el calculado (tolerancia 2 pts).
+        - descuento extremo (>= umbral) verificado.
+
+        Fail-safe: si faltan los flags de verificación, se trata como NO
+        verificado y se bloquea. NO toca Amazon ni price_error.
+        """
+        payload = item.message_payload or {}
+        if (payload.get("marketplace") or "").lower() != "mercadolibre":
+            return None
+        if item.type != OutboxType.NORMAL.value:
+            return None
+
+        # Variante incorrecta (precio de otra presentación/sabor/peso).
+        if payload.get("ml_variant_mismatch") is True:
+            return self._ml_block(item, "ml_variant_mismatch")
+        if "variant_mismatch" in (payload.get("not_publishable_reasons") or []):
+            return self._ml_block(item, "ml_variant_mismatch")
+
+        # current_price = precio por unidad/kilo o mensualidad → no es total.
+        raw_current = str(payload.get("current_price_raw_text") or "")
+        if payload.get("current_price_is_unit_price") is True or _ML_UNIT_PRICE_TEXT_RE.search(raw_current):
+            return self._ml_block(item, "ml_unit_price_as_current_price")
+        if payload.get("current_price_is_installment") is True or _ML_INSTALLMENT_TEXT_RE.search(raw_current):
+            return self._ml_block(item, "ml_installment_as_current_price")
+
+        # Precio anterior verificado obligatorio para publicar descuento.
+        if not payload.get("ml_previous_price_verified"):
+            return self._ml_block(item, "ml_no_verified_previous_price")
+
+        try:
+            cur = float(payload.get("current_price"))
+            prev = float(payload.get("previous_price"))
+        except (TypeError, ValueError):
+            return self._ml_block(item, "ml_no_verified_current_price")
+        if cur <= 0:
+            return self._ml_block(item, "ml_no_verified_current_price")
+        if prev <= cur:
+            return self._ml_block(item, "ml_no_verified_previous_price")
+
+        # previous_price de otra variante (flag explícito).
+        if payload.get("ml_previous_price_from_other_variant") is True:
+            return self._ml_block(item, "ml_previous_price_from_other_variant")
+
+        computed = round((prev - cur) / prev * 100)
+
+        # Descuento extremo: exige verificación explícita.
+        if computed >= self.ml_extreme_discount_threshold:
+            if not payload.get("ml_extreme_discount_verified"):
+                return self._ml_block(item, "ml_extreme_discount_unverified")
+
+        # Descuento declarado coherente con el calculado.
+        declared = payload.get("discount_percent")
+        if declared is not None:
+            try:
+                if abs(float(declared) - computed) > 2:
+                    return self._ml_block(item, "ml_discount_mismatch")
+            except (TypeError, ValueError):
+                return self._ml_block(item, "ml_discount_mismatch")
+
+        return None
+
+    def _ml_block(self, item: OutboxItem, reason: str) -> PublishOutcome:
+        logger.warning("publish ML bloqueado (id=%s): %s", item.id, reason)
         return PublishOutcome(
             success=False,
             dry_run=self.client.dry_run,
@@ -512,18 +616,13 @@ class WhatsAppPublisher:
                         "amazon offer requires previous_price"
                     )
             else:
-                # ML/otros: si no hay previous_price pero sí discount_percent
-                # y current_price, lo derivamos matemáticamente. Esto cubre
-                # items de ML donde el precio anterior no siempre está en el
-                # DOM pero el descuento sí.
-                if previous_price is None and current_price is not None:
-                    try:
-                        disc_val = float(discount_percent)
-                        cur_val = float(current_price)
-                        if 0 < disc_val < 100 and cur_val > 0:
-                            previous_price = round(cur_val / (1 - disc_val / 100.0), 2)
-                    except (TypeError, ValueError):
-                        pass
+                # ML/otros: NUNCA derivar previous_price desde el descuento.
+                # Inventar "Antes" a partir del % es el bug de falsos positivos
+                # (descuentos como 78% sin precio anterior tachado real). El
+                # gate ML ya exige previous_price verificado; aquí solo se
+                # formatea lo verificado. Si no hay previous_price real, el
+                # formatter lanza FormatterError y el item no se publica.
+                pass
             if previous_price is None:
                 raise FormatterError(
                     "normal offer requires previous_price + discount_percent"

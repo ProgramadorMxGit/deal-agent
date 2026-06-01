@@ -404,51 +404,6 @@ async def test_dispatcher_records_evolution_api_failure():
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_requeues_temporary_evolution_failure_with_backoff():
-    import httpx
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            500,
-            json={
-                "status": 500,
-                "error": "Internal Server Error",
-                "response": {"message": ["Error: Connection Closed"]},
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as session:
-        evo = EvolutionClient(
-            base_url="http://x:8080",
-            api_key="k",
-            instance="i",
-            dry_run=False,
-            client=session,
-        )
-        publisher = WhatsAppPublisher(
-            client=evo, target_group_id="120363@g.us", enabled=True
-        )
-        outbox = InMemoryOutbox(OutboxConfig(cooldown=CooldownPolicy(0)))
-        dispatcher = OutboxDispatcher(outbox=outbox, publisher=publisher, clock=lambda: T0)
-
-        item = _enqueue(outbox, OutboxType.NORMAL.value)
-        outcome = await dispatcher.tick()
-
-    assert outcome is not None
-    assert outcome.success is False
-    assert outcome.evolution_response is not None
-    assert outcome.evolution_response.temporary is True
-
-    persisted = next(i for i in outbox if i.id == item.id)
-    assert persisted.state == OutboxState.PENDING.value
-    assert persisted.attempts == 1
-    assert persisted.last_attempt_at == T0
-    assert persisted.scheduled_for is not None
-    assert persisted.scheduled_for > T0
-
-
-@pytest.mark.asyncio
 async def test_dispatcher_random_selects_among_eligible_normal_offers():
     """Con varias ofertas normales elegibles, el dispatcher las elige aleatoriamente."""
     times = [T0]

@@ -506,23 +506,17 @@ class AmazonHunterAgent:
             "source": Source.AMAZON_HUNTER.value,
             "requires_live_validation": False,
         }
-        cur = self.db.execute(
-            "INSERT INTO outbox (offer_id, type, enqueued_at, scheduled_for, attempts, "
-            "last_attempt_at, state, message_payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                offer_id,
-                outbox_type,
-                _now_iso(),
-                None,
-                0,
-                None,
-                OutboxState.PENDING.value,
-                json.dumps(payload, ensure_ascii=False),
-            ),
+        from ..dispatching.outbox_admission import enqueue_with_quota, load_quota_config
+        outbox_id = enqueue_with_quota(
+            self.db,
+            offer_id=offer_id,
+            outbox_type=outbox_type,
+            payload=payload,
+            config=load_quota_config(),
+            now_iso_fn=_now_iso,
         )
         self._update_product_affiliate(product, affiliate)
-        return cur.lastrowid
+        return outbox_id
 
     async def _maybe_extract_affiliate(
         self,

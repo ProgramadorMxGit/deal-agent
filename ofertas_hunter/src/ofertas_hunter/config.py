@@ -215,6 +215,24 @@ class Settings(BaseSettings):
     # `systemctl stop/start` necesita `sudo -n` (sudo sin password).
     nightly_maintenance_use_sudo: bool = True
 
+    # --- Shutdown limpio del orquestador (SIGTERM/SIGINT) ---
+    # Tope global del cierre ordenado (loops + browsers + locks). Debe ser
+    # menor que TimeoutStopSec del unit systemd para terminar antes de SIGKILL.
+    orchestrator_shutdown_timeout_seconds: float = 90.0
+    # Tope por browser/contexto Playwright al cerrar.
+    browser_close_timeout_seconds: float = 15.0
+
+    # --- ML session health check ---
+    ml_session_health_enabled: bool = True
+    ml_session_health_every_minutes: int = 30
+    ml_session_login_required_backoff_minutes: int = 60
+    ml_session_health_check_url: str = "https://www.mercadolibre.com.mx/ofertas"
+
+    # --- Métricas de conversión discovery → PDP → pending ---
+    discovery_conversion_metrics_enabled: bool = True
+    discovery_conversion_every_minutes: int = 30
+    discovery_conversion_window_minutes: int = 60
+
     # LLM
     llm_heal_enabled: bool = False
     llm_backend: str = "none"  # kiro_cli | anthropic | none
@@ -237,6 +255,65 @@ class Settings(BaseSettings):
     # un binario distinto). Si está vacío usa la auto-detección estándar.
     diversity_curator_kiro_cli_path: Optional[str] = None
 
+    # --- Topes DUROS de diversidad (hard caps) ---------------------------
+    # Funcionan AUNQUE el LLM esté apagado. Antes de elegir candidato se
+    # rechazan (skip temporal, NO discard) los que violen estos topes dentro
+    # de una ventana móvil de las últimas N publicaciones. Si TODOS los
+    # candidatos válidos violan diversidad y allow_override=True, se publica
+    # el "menos repetitivo" registrando override; si False, no se publica ese
+    # ciclo. NUNCA relajan gates de seguridad.
+    diversity_hard_cap_enabled: bool = True
+    diversity_window_size: int = 10
+    diversity_max_same_category_in_window: int = 3
+    diversity_max_same_brand_in_window: int = 2
+    diversity_max_same_product_family_in_window: int = 1
+    diversity_max_same_marketplace_in_window: int = 7
+    diversity_fuzzy_title_threshold: float = 0.85
+    diversity_reject_similar_hours: int = 24
+    diversity_allow_override_if_no_alternative: bool = True
+    diversity_trace_decisions: bool = True
+
+    # --- Cuotas de entrada al pending (Opción A: >=50% global intacto) -----
+    # Evitan que una sola categoría/marca/marketplace sature el pool
+    # publicable. Items que saturarían una cuota se encolan como `deferred`
+    # (NO descartados) y se promueven luego. NO relaja gates ni descuento.
+    outbox_category_quota_enabled: bool = True
+    outbox_max_pending_category_pct: float = 40.0
+    outbox_max_pending_brand_pct: float = 20.0
+    outbox_max_pending_marketplace_pct: float = 75.0
+    outbox_min_target_categories: int = 4
+    outbox_defer_saturated_categories: bool = True
+    outbox_defer_minutes: int = 60
+    outbox_defer_max_minutes: int = 240
+    outbox_exceptional_discount_threshold: float = 70.0
+    outbox_deferred_promotion_enabled: bool = True
+    outbox_min_pending_before_quota: int = 8
+
+    # --- Category deficit planner ---
+    category_deficit_planner_enabled: bool = True
+    category_deficit_target_categories: str = (
+        "tecnologia,hogar,bebe,herramientas,ropa,despensa,juguetes,"
+        "mascotas,belleza,proteina/suplementos"
+    )
+    category_deficit_plan_every_seconds: int = 300
+
+    # --- Frontier category-aware ---
+    frontier_category_aware_enabled: bool = True
+    frontier_deficit_boost: float = 2.0
+    frontier_saturated_penalty: float = 0.5
+    frontier_category_aware_min_score: float = 0.0
+
+    # --- Re-seeding periódico de seeds curadas + decay de backlog viejo ---
+    curated_seed_reseed_enabled: bool = True
+    curated_seed_reseed_every_minutes: int = 60
+    curated_seed_min_score: float = 20.0
+    curated_seed_force_refresh_hours: int = 6
+    curated_seed_max_per_cycle: int = 100
+    curated_seed_marketplaces: str = "amazon,mercadolibre"
+    frontier_old_url_decay_enabled: bool = True
+    frontier_old_url_decay_hours: int = 24
+    frontier_old_url_decay_factor: float = 0.25
+
     # Scoring thresholds
     price_error_threshold_confirmed: int = 80
     price_error_threshold_possible: int = 60
@@ -253,6 +330,10 @@ class Settings(BaseSettings):
     # extremos sin verificar). Ver whatsapp_publisher._amazon_gate.
     amazon_extreme_discount_threshold: float = 90.0
     amazon_min_absolute_price: float = 10.0
+    # Mercado Libre: umbral de descuento extremo que exige verificación
+    # explícita (ml_extreme_discount_verified). Por debajo, exige
+    # previous_price + current_price verificados. NO relaja descuento global.
+    ml_extreme_discount_threshold: float = 70.0
     # Enriquecimiento automático de afiliados Amazon en el loop.
     amazon_affiliate_enrich_limit: int = 5
     amazon_affiliate_enrich_timeout_seconds: float = 90.0

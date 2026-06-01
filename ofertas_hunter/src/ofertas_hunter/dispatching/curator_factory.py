@@ -17,6 +17,7 @@ import sqlite3
 from typing import TYPE_CHECKING, Optional
 
 from .diversity_curator import DiversityCurator
+from .diversity_filters import HardCapConfig
 from .diversity_scorer import DiversityScorer
 
 if TYPE_CHECKING:
@@ -48,6 +49,18 @@ def build_diversity_curator(
     scorer = DiversityScorer(
         history_size=settings.diversity_curator_history_size,
         top_n=settings.diversity_curator_candidate_limit,
+    )
+
+    hard_cap_config = HardCapConfig(
+        enabled=settings.diversity_hard_cap_enabled,
+        window_size=settings.diversity_window_size,
+        max_same_category=settings.diversity_max_same_category_in_window,
+        max_same_brand=settings.diversity_max_same_brand_in_window,
+        max_same_product_family=settings.diversity_max_same_product_family_in_window,
+        max_same_marketplace=settings.diversity_max_same_marketplace_in_window,
+        fuzzy_title_threshold=settings.diversity_fuzzy_title_threshold,
+        reject_similar_hours=settings.diversity_reject_similar_hours,
+        allow_override_if_no_alternative=settings.diversity_allow_override_if_no_alternative,
     )
 
     llm_client = None
@@ -82,6 +95,8 @@ def build_diversity_curator(
         llm_client=llm_client,
         history_size=settings.diversity_curator_history_size,
         candidate_limit=settings.diversity_curator_candidate_limit,
+        hard_cap_config=hard_cap_config,
+        trace_decisions=settings.diversity_trace_decisions,
     )
 
 

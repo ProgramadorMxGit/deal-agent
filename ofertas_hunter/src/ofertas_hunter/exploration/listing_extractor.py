@@ -1,5 +1,7 @@
 """Extractores de URLs desde páginas de listing / categoría / deals.
 
+EXTRACTOR_V2: soporta deal grids Amazon (data-asin), poly-card ML y promotion-item.
+
 Reciben HTML como string y devuelven listas de `ClassifiedUrl` ya tipadas.
 **Puros**: sin red, sin Playwright. Esto los hace testables con fixtures.
 
@@ -129,6 +131,18 @@ def extract_amazon_deals(html: str, base_url: Optional[str] = None) -> list[Clas
     soup = BeautifulSoup(html, "html.parser")
     discovered: list[ClassifiedUrl] = []
 
+    # EXTRACTOR_V2: deal grids + search cards modernas.
+    # (a) data-asin en cualquier contenedor (deals grid / search result).
+    for container in soup.select("[data-asin]"):
+        asin = (container.get("data-asin") or "").strip()
+        if asin and len(asin) == 10 and asin.isalnum():
+            discovered.append(
+                ClassifiedUrl(
+                    url=f"{_DEFAULT_AMAZON_BASE}/dp/{asin}",
+                    marketplace="amazon", kind="product", score=12.0,
+                )
+            )
+    # (b) cualquier <a> con /dp/ASIN (carruseles, grids, links directos).
     for a in soup.select("a[href*='/dp/']"):
         href = a.get("href")
         if not href:
@@ -136,12 +150,19 @@ def extract_amazon_deals(html: str, base_url: Optional[str] = None) -> list[Clas
         url = _normalize(href, base)
         info = classify(url)
         if info.kind == "product":
-            # Productos en /deals tienen prioridad mayor
             discovered.append(
                 ClassifiedUrl(
                     url=info.url, marketplace=info.marketplace, kind=info.kind, score=12.0
                 )
             )
+    # (c) paginación de búsquedas filtradas (mantener recurrencia de deal search).
+    for a in soup.select("a.s-pagination-next, a.s-pagination-item"):
+        href = a.get("href")
+        if not href or "disabled" in (a.get("aria-disabled") or ""):
+            continue
+        info = classify(_normalize(href, base))
+        if info.kind == "listing":
+            discovered.append(info)
     return _dedup_classified(discovered)
 
 
@@ -163,6 +184,7 @@ def extract_mercadolibre_listing(
     # Productos en cards
     for a in soup.select(
         "a.ui-search-item__group__element, a.ui-search-link, "
+        "a.poly-component__title, a.promotion-item__link-container, "
         "a[href*='/p/MLM'], a[href*='/MLM']"
     ):
         href = a.get("href")
@@ -197,14 +219,20 @@ def extract_mercadolibre_listing(
 _ML_CARD_SELECTORS = (
     "li.ui-search-layout__item",
     "div.ui-search-result__wrapper",
-    "div.andes-card",
     "div.poly-card",
+    "div.andes-card",
+    "li.promotion-item",
+    "div.promotion-item",
+    "ol.items_container > li",
+    "div.ui-recommendations-card",
 )
 
 _ML_PRODUCT_LINK_SELECTORS = (
+    "a.poly-component__title",
     "a.ui-search-link",
     "a.ui-search-item__group__element",
-    "a.poly-component__title",
+    "a.promotion-item__link-container",
+    "a.ui-recommendations-card__link",
     "a[href*='/p/MLM']",
     "a[href*='/MLM']",
 )

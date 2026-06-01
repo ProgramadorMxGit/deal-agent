@@ -350,22 +350,15 @@ def _enqueue_outbox(
         "validation_errors": data.get("validation_errors") or [],
         "reject_reason": None,
     }
-    cur = db.execute(
-        "INSERT INTO outbox (offer_id, type, enqueued_at, scheduled_for, attempts, "
-        "last_attempt_at, state, message_payload_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            offer_id,
-            outbox_type,
-            _now_iso(),
-            None,
-            0,
-            None,
-            OutboxState.PENDING.value,
-            json.dumps(payload, ensure_ascii=False),
-        ),
+    from ...dispatching.outbox_admission import enqueue_with_quota, load_quota_config
+    return enqueue_with_quota(
+        db,
+        offer_id=offer_id,
+        outbox_type=outbox_type,
+        payload=payload,
+        config=load_quota_config(),
+        now_iso_fn=_now_iso,
     )
-    return cur.lastrowid
 
 
 def _save_discard(

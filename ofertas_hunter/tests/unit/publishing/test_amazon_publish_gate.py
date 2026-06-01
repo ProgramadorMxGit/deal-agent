@@ -281,8 +281,11 @@ async def test_non_amazon_unaffected_by_amazon_gate(dry_run_client):
             "marketplace": "mercadolibre",
             "affiliate_url": "https://meli.la/abc",
             "url": "https://meli.la/abc",
+            "ml_previous_price_verified": True,
+            "current_price_verified": True,
+            "current_price_raw_text": "$350",
         },
     )
     out = await publisher.publish(item)
-    # ML pasa el gate de Amazon (no aplica) y su propio gate (tiene afiliado).
+    # ML pasa el gate de Amazon (no aplica) y su propio gate (precio verificado).
     assert out.success is True

@@ -159,6 +159,48 @@ class FrontierRepo:
             for r in rows
         ]
 
+    def pop_category_aware(
+        self,
+        marketplace: str,
+        *,
+        kind: Optional[str] = None,
+        limit: int = 5,
+        deficit_categories: Optional[list] = None,
+        saturated_categories: Optional[list] = None,
+        deficit_boost: float = 2.0,
+        saturated_penalty: float = 0.5,
+        candidate_multiplier: int = 6,
+    ) -> list[FrontierItem]:
+        """Pop con sesgo por categoría deficitaria.
+
+        Lee un superset de candidatos (limit*candidate_multiplier), reordena por
+        score ajustado (boost a deficit, penalty a saturadas) y consume los top
+        `limit`. Si no hay plan de categorías, equivale a `pop` normal.
+        """
+        from .frontier_category import category_of_url, adjusted_score
+
+        if not deficit_categories and not saturated_categories:
+            return self.pop(marketplace, kind=kind, limit=limit)
+
+        pool = self.peek(marketplace, kind=kind, limit=max(limit, limit * candidate_multiplier))
+        if not pool:
+            return []
+        ranked = sorted(
+            pool,
+            key=lambda it: adjusted_score(
+                it.score, category_of_url(it.url),
+                deficit_categories, saturated_categories,
+                deficit_boost=deficit_boost, saturated_penalty=saturated_penalty,
+            ),
+            reverse=True,
+        )
+        chosen = ranked[:limit]
+        ids = tuple(it.id for it in chosen)
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            self.db.execute(f"DELETE FROM frontier WHERE id IN ({placeholders})", ids)
+        return chosen
+
     def increment_retries(self, item_id: int) -> None:
         self.db.execute(
             "UPDATE frontier SET retries = retries + 1 WHERE id = ?", (item_id,)

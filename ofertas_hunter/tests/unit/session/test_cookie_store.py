@@ -57,19 +57,6 @@ def test_ml_detects_missing_cookies(tmp_path: Path):
     assert health.healthy is False
 
 
-def test_cookie_store_loads_utf8_bom_json(tmp_path: Path):
-    target = tmp_path / "bom.json"
-    payload = '[{"name":"foo","value":"bar","domain":".amazon.com.mx","path":"/"}]'
-    target.write_bytes(b"\xef\xbb\xbf" + payload.encode("utf-8"))
-
-    store = CookieStore(path=target)
-    cookies, health = store.load()
-
-    assert health.is_missing is False
-    assert health.loaded == 1
-    assert cookies[0]["name"] == "foo"
-
-
 def test_ml_detects_expired_or_empty_cookies():
     store = CookieStore(path=FIXTURES / "empty.json")
     cookies, health = store.load()

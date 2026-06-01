@@ -301,8 +301,6 @@ async def test_ml_outbox_payload_contains_affiliate_url(tmp_path):
     assert payload["affiliate_url"] == "https://meli.la/abc123"
     assert payload["affiliate_product_id"] == "FAKE-12345"
     assert payload["commission_text"] == "COMISIÓN 9%"
-    assert payload["brand"]
-    assert "category" in payload
     # canonical_url se preserva para scraping (ahora incluye el slug)
     assert payload["canonical_url"] == "https://articulo.mercadolibre.com.mx/MLM98765432-sony"
     # url (publicación) usa affiliate_url

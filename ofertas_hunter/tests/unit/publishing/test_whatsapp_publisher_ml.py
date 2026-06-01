@@ -20,6 +20,11 @@ def _ml_payload(*, with_affiliate: bool, type_=OutboxType.NORMAL.value) -> dict:
         "canonical_url": "https://articulo.mercadolibre.com.mx/MLM98765432",
         "url": "https://articulo.mercadolibre.com.mx/MLM98765432",
         "confidence_label": "high",
+        # Nuevo contrato ML: precio anterior verificado (strikethrough real).
+        "ml_previous_price_verified": True,
+        "current_price_verified": True,
+        "discount_percent_verified": True,
+        "current_price_raw_text": "$3,499",
     }
     if with_affiliate:
         payload["affiliate_url"] = "https://meli.la/abc123"
