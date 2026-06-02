@@ -151,6 +151,10 @@ class ScreenshotCapturer:
         self._lock = asyncio.Lock()
         # Si Playwright no está disponible, desactivamos para no reintentar.
         self._unavailable = False
+        # Contador de fallos de arranque consecutivos. Sólo tras varios
+        # seguidos se desactiva la feature (evita apagado permanente por un
+        # hipo transitorio). Se resetea al primer arranque exitoso.
+        self._launch_failures = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -160,6 +164,20 @@ class ScreenshotCapturer:
         """Arranca el navegador y carga cookies. Devuelve False si no se pudo."""
         if self._unavailable:
             return False
+        # Si el contexto existe pero el browser murió (crash de Chromium,
+        # OOM, etc.), reconstruimos. `is_connected()` es la señal fiable.
+        if self._context is not None:
+            browser = self._browser
+            try:
+                if browser is not None and not browser.is_connected():
+                    logger.warning(
+                        "ScreenshotCapturer: browser desconectado; reconstruyendo"
+                    )
+                    await self._teardown()
+                else:
+                    return True
+            except Exception:
+                await self._teardown()
         if self._context is not None:
             return True
         try:
@@ -199,12 +217,28 @@ class ScreenshotCapturer:
             )
             await self._inject_cookies()
             self._page = await self._context.new_page()
+            self._launch_failures = 0
             logger.info("ScreenshotCapturer iniciado (headless=%s)", self.headless)
             return True
         except Exception as exc:
-            logger.warning("ScreenshotCapturer: arranque falló (%s)", exc)
-            await self.aclose()
-            self._unavailable = True
+            # NO latcheamos `_unavailable` para fallos transitorios de arranque
+            # (OOM puntual, race). Sólo tras varios intentos seguidos lo
+            # desactivamos para no reintentar en cada publicación. Así un
+            # hipo transitorio no apaga la feature para toda la vida del bot.
+            self._launch_failures += 1
+            logger.warning(
+                "ScreenshotCapturer: arranque falló (intento %d): %s",
+                self._launch_failures,
+                exc,
+            )
+            await self._teardown()
+            if self._launch_failures >= 5:
+                logger.error(
+                    "ScreenshotCapturer: %d fallos de arranque seguidos; "
+                    "desactivando hasta reinicio",
+                    self._launch_failures,
+                )
+                self._unavailable = True
             return False
 
     async def _inject_cookies(self) -> None:
@@ -237,7 +271,9 @@ class ScreenshotCapturer:
         except Exception as exc:
             logger.warning("ScreenshotCapturer: cookies Amazon no cargadas (%s)", exc)
 
-    async def aclose(self) -> None:
+    async def _teardown(self) -> None:
+        """Cierra browser/context/playwright actuales (sin desactivar la
+        feature). Permite reconstruir en el próximo `_ensure_started`."""
         for closer in (
             lambda: self._context.close() if self._context else None,
             lambda: self._browser.close() if self._browser else None,
@@ -253,6 +289,9 @@ class ScreenshotCapturer:
         self._browser = None
         self._playwright = None
         self._page = None
+
+    async def aclose(self) -> None:
+        await self._teardown()
 
     # ------------------------------------------------------------------
     # Captura
@@ -286,12 +325,17 @@ class ScreenshotCapturer:
                     url[:80],
                     exc,
                 )
-                # Recrear página si quedó en mal estado.
+                # Si el browser murió, hacemos teardown para que la próxima
+                # captura reconstruya todo. Si sólo la page se cerró, la
+                # recreamos. Nunca latcheamos `_unavailable` aquí.
                 try:
-                    if self._page is not None and self._page.is_closed():
+                    browser = self._browser
+                    if browser is not None and not browser.is_connected():
+                        await self._teardown()
+                    elif self._page is not None and self._page.is_closed():
                         self._page = await self._context.new_page()
                 except Exception:
-                    pass
+                    await self._teardown()
                 return None
 
     async def _capture_locked(self, marketplace: str, url: str) -> Optional[bytes]:
