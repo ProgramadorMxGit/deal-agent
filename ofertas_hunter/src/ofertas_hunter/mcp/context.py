@@ -242,8 +242,12 @@ class ServerContext:
         Lazy + best-effort. Si `PUBLISH_SCREENSHOT_ENABLED=false` devuelve None
         (el publisher usará la imagen pública). Gestiona su propio navegador
         headless, separado de los browsers de hunt/revalidación.
+
+        Default `True`: si el campo no existe en un config parcial/stale, la
+        feature NO se desactiva silenciosamente (matchea el default de
+        config.py). Sólo se apaga con `PUBLISH_SCREENSHOT_ENABLED=false`.
         """
-        if not getattr(self.settings, "publish_screenshot_enabled", False):
+        if not getattr(self.settings, "publish_screenshot_enabled", True):
             return None
         if self._screenshot_capturer is None:
             from ..publishing.screenshot_capturer import ScreenshotCapturer

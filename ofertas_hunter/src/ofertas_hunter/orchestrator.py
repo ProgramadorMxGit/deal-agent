@@ -268,7 +268,7 @@ class AgentFactoryBuilder:
                 dry_run=s.publishing_dry_run,
             )
             screenshot_capturer = None
-            if getattr(s, "publish_screenshot_enabled", False):
+            if getattr(s, "publish_screenshot_enabled", True):
                 try:
                     from .publishing.screenshot_capturer import ScreenshotCapturer
 
