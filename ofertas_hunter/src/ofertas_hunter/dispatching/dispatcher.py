@@ -499,6 +499,11 @@ def make_sqlite_published_recorder(conn) -> PublishedRecorder:
     async def _record(item: OutboxItem, outcome: PublishOutcome, when: datetime) -> None:
         text = outcome.formatted.text if outcome.formatted else ""
         media_url = outcome.formatted.image_url if outcome.formatted else None
+        # Trazabilidad: prefijar con el tipo de media realmente enviado
+        # ("screenshot" del PDP vs "image_url" público de fallback) para poder
+        # auditar en producción si la captura está funcionando.
+        if getattr(outcome, "media_kind", None) and media_url is not None:
+            media_url = f"[{outcome.media_kind}:{outcome.media_bytes or 0}] {media_url}"
         evolution_response = (
             json.dumps(outcome.evolution_response.raw, ensure_ascii=False)
             if outcome.evolution_response and outcome.evolution_response.raw

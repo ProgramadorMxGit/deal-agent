@@ -96,6 +96,11 @@ class PublishOutcome:
     # el dispatcher pueda actualizarlos en el outbox antes de marcarlo.
     degraded_outbox_type: Optional[str] = None
     degraded_payload: Optional[dict] = None
+    # Qué media se envió realmente: "screenshot" (captura del PDP) o
+    # "image_url" (foto pública del catálogo, fallback). Trazabilidad para
+    # confirmar que la captura está funcionando en producción.
+    media_kind: Optional[str] = None
+    media_bytes: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +237,8 @@ class WhatsAppPublisher:
         # pública. Best-effort: si falla, usamos `formatted.image_url`.
         media: Any = formatted.image_url
         file_name = _safe_filename(formatted)
+        media_kind = "image_url"
+        media_bytes: Optional[int] = None
         if self.screenshot_capturer is not None:
             try:
                 shot = await self.screenshot_capturer.capture(item.message_payload or {})
@@ -241,6 +248,8 @@ class WhatsAppPublisher:
             if shot:
                 media = shot
                 file_name = _screenshot_filename(formatted)
+                media_kind = "screenshot"
+                media_bytes = len(shot)
                 logger.info(
                     "publish id=%s usando screenshot PDP (%d bytes)", item.id, len(shot)
                 )
@@ -264,6 +273,8 @@ class WhatsAppPublisher:
             error=evolution_response.error,
             degraded_outbox_type=item.type if was_degraded else None,
             degraded_payload=dict(item.message_payload) if was_degraded else None,
+            media_kind=media_kind,
+            media_bytes=media_bytes,
         )
 
     # ------------------------------------------------------------------
