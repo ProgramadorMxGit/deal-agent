@@ -30,6 +30,7 @@ from .formatter import (
     format_normal_offer,
     format_price_error,
 )
+from .screenshot_capturer import ScreenshotCapturer
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ class WhatsAppPublisher:
         amazon_extreme_discount_threshold: float = 90.0,
         amazon_min_absolute_price: float = 10.0,
         ml_extreme_discount_threshold: float = 70.0,
+        screenshot_capturer: Optional["ScreenshotCapturer"] = None,
     ) -> None:
         """
         Args:
@@ -129,6 +131,10 @@ class WhatsAppPublisher:
                 `affiliate_url` válido (amzn.to/ o tag=) no se publican.
             amazon_min_discount_percent: descuento mínimo verificado para
                 publicar una oferta normal de Amazon.
+            screenshot_capturer: si se pasa, antes de publicar se captura un
+                screenshot del PDP real (imagen + título + precio + buy box) y
+                se envía ese en lugar de la imagen pública. Best-effort: si la
+                captura falla, se usa `image_url` como fallback.
         """
         self.client = client
         self.target_group_id = target_group_id or ""
@@ -139,6 +145,7 @@ class WhatsAppPublisher:
         self.amazon_extreme_discount_threshold = amazon_extreme_discount_threshold
         self.amazon_min_absolute_price = amazon_min_absolute_price
         self.ml_extreme_discount_threshold = ml_extreme_discount_threshold
+        self.screenshot_capturer = screenshot_capturer
 
     async def publish(self, item: OutboxItem) -> PublishOutcome:
         """Publica el item correspondiente al outbox.
@@ -220,11 +227,33 @@ class WhatsAppPublisher:
             )
 
         # La política de publicación es siempre con imagen (sendMedia).
+        # Si hay capturer, intentamos un screenshot del PDP real (imagen +
+        # título + precio + buy box) y lo enviamos en lugar de la imagen
+        # pública. Best-effort: si falla, usamos `formatted.image_url`.
+        media: Any = formatted.image_url
+        file_name = _safe_filename(formatted)
+        if self.screenshot_capturer is not None:
+            try:
+                shot = await self.screenshot_capturer.capture(item.message_payload or {})
+            except Exception as exc:  # nunca tumbar la publicación
+                logger.warning("screenshot capture raised (id=%s): %s", item.id, exc)
+                shot = None
+            if shot:
+                media = shot
+                file_name = _screenshot_filename(formatted)
+                logger.info(
+                    "publish id=%s usando screenshot PDP (%d bytes)", item.id, len(shot)
+                )
+            else:
+                logger.info(
+                    "publish id=%s sin screenshot, fallback a imagen pública", item.id
+                )
+
         evolution_response = await self.client.send_media(
             self.target_group_id,
-            formatted.image_url,
+            media,
             caption=formatted.text,
-            file_name=_safe_filename(formatted),
+            file_name=file_name,
         )
 
         return PublishOutcome(
@@ -655,6 +684,12 @@ def _safe_filename(msg: FormattedMessage) -> str:
     if msg.type == "price_error":
         return "error_de_precio.jpg"
     return "oferta.jpg"
+
+
+def _screenshot_filename(msg: FormattedMessage) -> str:
+    if msg.type == "price_error":
+        return "error_de_precio_captura.jpg"
+    return "oferta_captura.jpg"
 
 
 # ---------------------------------------------------------------------------

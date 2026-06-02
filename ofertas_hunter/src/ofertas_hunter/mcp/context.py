@@ -78,6 +78,7 @@ class ServerContext:
     _ml_browser: Any = None  # browser dedicado a ML (con user_data_dir)
     _evolution_client: Any = None
     _publisher: Any = None
+    _screenshot_capturer: Any = None
     _outbox_repo: Any = None
     _dispatcher: Any = None
     _amazon_hunter: Any = None
@@ -235,6 +236,35 @@ class ServerContext:
             )
         return self._evolution_client
 
+    def get_screenshot_capturer(self):
+        """Capturer de screenshots del PDP para la imagen de WhatsApp.
+
+        Lazy + best-effort. Si `PUBLISH_SCREENSHOT_ENABLED=false` devuelve None
+        (el publisher usará la imagen pública). Gestiona su propio navegador
+        headless, separado de los browsers de hunt/revalidación.
+        """
+        if not getattr(self.settings, "publish_screenshot_enabled", False):
+            return None
+        if self._screenshot_capturer is None:
+            from ..publishing.screenshot_capturer import ScreenshotCapturer
+
+            self._screenshot_capturer = ScreenshotCapturer(
+                mercadolibre_cookies_path=self.settings.mercadolibre_cookies_path,
+                mercadolibre_cookies_fallback_path=getattr(
+                    self.settings, "mercadolibre_cookies_fallback_path", None
+                ),
+                amazon_cookies_path=self.settings.amazon_cookies_path,
+                headless=getattr(self.settings, "publish_screenshot_headless", True),
+                nav_timeout_ms=getattr(
+                    self.settings, "publish_screenshot_nav_timeout_ms", 30000
+                ),
+                jpeg_quality=getattr(
+                    self.settings, "publish_screenshot_jpeg_quality", 85
+                ),
+                enabled=True,
+            )
+        return self._screenshot_capturer
+
     def get_publisher(self):
         if self._publisher is None:
             from ..publishing.whatsapp_publisher import WhatsAppPublisher
@@ -249,6 +279,7 @@ class ServerContext:
                 amazon_extreme_discount_threshold=self.settings.amazon_extreme_discount_threshold,
                 ml_extreme_discount_threshold=getattr(self.settings, "ml_extreme_discount_threshold", 70.0),
                 amazon_min_absolute_price=self.settings.amazon_min_absolute_price,
+                screenshot_capturer=self.get_screenshot_capturer(),
             )
         return self._publisher
 
@@ -769,6 +800,12 @@ class ServerContext:
                 await self._ml_browser.aclose()
             except Exception:
                 logger.exception("aclose ml_browser fallâ”œâ”‚")
+
+        if self._screenshot_capturer is not None:
+            try:
+                await self._screenshot_capturer.aclose()
+            except Exception:
+                logger.exception("aclose screenshot_capturer falló")
 
 
 __all__ = [

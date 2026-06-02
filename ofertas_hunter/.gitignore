@@ -24,6 +24,7 @@ data/exports/
 data/heal_samples/
 data/images/
 data/snapshots/
+data/screenshot_spike/
 logs/*.log
 
 # Secrets (NUNCA commitear cookies reales ni .env)

@@ -267,6 +267,25 @@ class AgentFactoryBuilder:
                 api_key_header=s.evolution_api_key_header,
                 dry_run=s.publishing_dry_run,
             )
+            screenshot_capturer = None
+            if getattr(s, "publish_screenshot_enabled", False):
+                try:
+                    from .publishing.screenshot_capturer import ScreenshotCapturer
+
+                    screenshot_capturer = ScreenshotCapturer(
+                        mercadolibre_cookies_path=s.mercadolibre_cookies_path,
+                        mercadolibre_cookies_fallback_path=(
+                            s.mercadolibre_cookies_fallback_path
+                        ),
+                        amazon_cookies_path=s.amazon_cookies_path,
+                        headless=s.publish_screenshot_headless,
+                        nav_timeout_ms=s.publish_screenshot_nav_timeout_ms,
+                        jpeg_quality=s.publish_screenshot_jpeg_quality,
+                        enabled=True,
+                    )
+                except Exception as exc:
+                    logger.warning("ScreenshotCapturer no disponible: %s", exc)
+                    screenshot_capturer = None
             publisher = WhatsAppPublisher(
                 client=client,
                 target_group_id=s.whatsapp_group,
@@ -276,6 +295,7 @@ class AgentFactoryBuilder:
                 amazon_min_discount_percent=s.amazon_min_discount_percent,
                 amazon_extreme_discount_threshold=s.amazon_extreme_discount_threshold,
                 amazon_min_absolute_price=s.amazon_min_absolute_price,
+                screenshot_capturer=screenshot_capturer,
             )
             outbox = SqliteOutbox(
                 self.db,
@@ -324,6 +344,11 @@ class AgentFactoryBuilder:
                         await browser.aclose()
                     except Exception:
                         logger.exception("dispatcher revalidator browser close failed")
+                if screenshot_capturer is not None:
+                    try:
+                        await screenshot_capturer.aclose()
+                    except Exception:
+                        logger.exception("screenshot capturer close failed")
                 await client.aclose()
 
         return factory

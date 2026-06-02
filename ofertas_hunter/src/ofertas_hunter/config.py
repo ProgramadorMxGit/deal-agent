@@ -187,6 +187,17 @@ class Settings(BaseSettings):
     publishing_enabled: bool = False
     publishing_dry_run: bool = True
     dispatcher_idle_sleep_seconds: float = 5.0
+
+    # Screenshot del PDP para la imagen de WhatsApp. Si está activo, antes de
+    # publicar se captura la zona superior de la página real del producto
+    # (imagen + título + precio + buy box) y se envía ESA en lugar de la imagen
+    # pública del catálogo. Best-effort: si la captura falla (captcha, timeout),
+    # se hace fallback a `image_url`.
+    publish_screenshot_enabled: bool = True
+    publish_screenshot_headless: bool = True
+    publish_screenshot_nav_timeout_ms: int = 30000
+    publish_screenshot_jpeg_quality: int = 85
+
     # Throttle incondicional del loop de Mercado Libre en el orquestador
     # (anti-runaway). Sin esto el loop gira a ~20 ciclos/s cuando el
     # frontier está lleno. 5s ≈ 720 ciclos/h máx; 10s ≈ 360 ciclos/h.

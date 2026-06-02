@@ -6,7 +6,13 @@ Log de decisiones por bloque, alineado con la spec del usuario.
 
 ## 2026-06-01
 
-* Archivo: `tests/unit/publishing/test_evolution_client.py`
+* Archivo: `src/ofertas_hunter/publishing/screenshot_capturer.py` (nuevo), `src/ofertas_hunter/publishing/whatsapp_publisher.py`, `src/ofertas_hunter/orchestrator.py`, `src/ofertas_hunter/config.py`, `tests/unit/publishing/test_publisher_screenshot.py` (nuevo), `tests/unit/publishing/test_screenshot_capturer_urls.py` (nuevo), `.env.example`, `.gitignore`
+* Cambio: la imagen que se despacha al grupo de WhatsApp ahora es un screenshot recortado de la ficha real del producto (imagen + título + precio + caja de compra), estilo `_capture_detail_section` del scraper legacy, para Amazon y Mercado Libre. `ScreenshotCapturer` gestiona su propio navegador headless con viewport desktop fijo (1366x900), inyecta cookies ML+Amazon, reescribe `articulo.mercadolibre.com.mx`→`www.` (la forma `articulo.` 404 en catálogo `/p/MLM`) y une las columnas clave del PDP. El `WhatsAppPublisher` lo invoca antes de `send_media`. Best-effort: si la captura falla (captcha/timeout/sin URL), fallback automático a la imagen pública `image_url`. Controlado por `PUBLISH_SCREENSHOT_ENABLED` (default true).
+* Motivo: la imagen pública del catálogo se veía pobre; el operador validó visualmente las capturas del spike y pidió usarlas siempre.
+* Relación: spike previo en `scripts/spike_product_screenshots.py`; chokepoint único en el publisher (todo lo despachado pasa por `send_media`).
+* Resultado: ✅ 1149 unit tests verdes (2 skip Windows); verificación E2E del capturer real produjo JPEGs válidos para ML (incl. reescritura articulo→www) y Amazon.
+
+
 * Cambio: agregada regresión en rojo para clasificar `Connection Closed` de Evolution como fallo temporal (`temporary`) en vez de fallo HTTP genérico.
 * Motivo: en VPS la instancia aparece `open`, pero `sendText/sendMedia` están devolviendo `Connection Closed`; había que fijar ese contrato antes del hardening del dispatcher.
 * Relación: abre el bloque de reintentos seguros del transporte Evolution.
