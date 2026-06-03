@@ -240,7 +240,6 @@ class ScreenshotCapturer:
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
             )
             await self._inject_cookies()
-            self._page = await self._context.new_page()
             self._launch_failures = 0
             logger.info("ScreenshotCapturer iniciado (headless=%s)", self.headless)
             return True
@@ -340,8 +339,13 @@ class ScreenshotCapturer:
         async with self._lock:
             if not await self._ensure_started():
                 return None
+            page = None
             try:
-                return await self._capture_locked(marketplace, url)
+                # Página FRESCA por captura: evita que una sola página de vida
+                # larga se quede "trabada" (interstitial/modal/nav colgada) y
+                # haga fallar todas las capturas siguientes hasta reiniciar.
+                page = await self._context.new_page()
+                return await self._capture_locked(page, marketplace, url)
             except Exception as exc:
                 logger.warning(
                     "ScreenshotCapturer: captura falló marketplace=%s url=%s (%s)",
@@ -349,23 +353,24 @@ class ScreenshotCapturer:
                     url[:80],
                     exc,
                 )
-                # Si el browser murió, hacemos teardown para que la próxima
-                # captura reconstruya todo. Si sólo la page se cerró, la
-                # recreamos. Nunca latcheamos `_unavailable` aquí.
+                # Si el browser murió, teardown para reconstruir en la próxima.
                 try:
                     browser = self._browser
                     if browser is not None and not browser.is_connected():
                         await self._teardown()
-                    elif self._page is not None and self._page.is_closed():
-                        self._page = await self._context.new_page()
                 except Exception:
                     await self._teardown()
                 return None
+            finally:
+                # Cerrar la página de esta captura SIEMPRE (no acumular estado).
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
-    async def _capture_locked(self, marketplace: str, url: str) -> Optional[bytes]:
+    async def _capture_locked(self, page: Any, marketplace: str, url: str) -> Optional[bytes]:
         sel = _MARKETPLACE_SELECTORS[marketplace]
-        page = self._page
-        assert page is not None
 
         await page.goto(url, wait_until="domcontentloaded", timeout=self.nav_timeout_ms)
 
