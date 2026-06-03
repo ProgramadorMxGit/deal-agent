@@ -60,3 +60,18 @@ def test_resolve_capture_url_amazon_falls_back_to_url():
         "url": "https://www.amazon.com.mx/dp/B00861CC7Y?tag=x",
     }
     assert resolve_capture_url(payload) == "https://www.amazon.com.mx/dp/B00861CC7Y?tag=x"
+
+
+def test_dismiss_overlays_js_targets_coachmark_and_floater():
+    """El JS de dismiss debe apuntar a los coachmarks de ML y al react-floater
+    que envuelve el popup 'Haz tu primera compra mayorista' (precios por unidad).
+    Sin esto, el screenshot capturaba el overlay mayorista y engañaba al lector.
+    """
+    from ofertas_hunter.publishing.screenshot_capturer import _DISMISS_OVERLAYS_JS
+
+    js = _DISMISS_OVERLAYS_JS
+    assert "coach-mark" in js
+    assert "__floater" in js
+    assert "andes-popper" in js
+    # Debe ocultar con display:none !important para ganar a estilos inline.
+    assert "display" in js and "none" in js

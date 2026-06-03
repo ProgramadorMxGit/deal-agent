@@ -46,6 +46,30 @@ _MAX_SECTION_WIDTH = 1200.0
 _MAX_SECTION_HEIGHT = 980.0
 _PAD = 16
 
+# JS que oculta coachmarks/onboarding/tooltips que se superponen al contenido
+# (Mercado Libre: "Haz tu primera compra mayorista" con precios por unidad;
+# también react-floater, andes-popper, etc.). Ocultar es más robusto que
+# clickear el botón "Cerrar" (no depende de timing ni de interceptación).
+_DISMISS_OVERLAYS_JS = r"""() => {
+  const selectors = [
+    '.andes-coach-marks',
+    '[class*="coach-mark"]',
+    '[class*="coachmark"]',
+    '.__floater',
+    '[class*="__floater"]',
+    '.andes-popper',
+    '[data-testid="coachmark"]',
+    '[class*="onboarding"]',
+  ];
+  let hidden = 0;
+  for (const s of selectors) {
+    document.querySelectorAll(s).forEach((el) => {
+      try { el.style.setProperty('display', 'none', 'important'); hidden++; } catch (e) {}
+    });
+  }
+  return hidden;
+}"""
+
 # Selectores por marketplace: columnas a unir (recorte preferido), contenedores
 # fallback, selector de título a esperar y banners de cookies a aceptar.
 _MARKETPLACE_SELECTORS: dict[str, dict[str, Any]] = {
@@ -368,6 +392,17 @@ class ScreenshotCapturer:
             )
             return None
 
+        # Cerrar coachmarks/onboarding que ML superpone sobre el precio
+        # (p.ej. "Haz tu primera compra mayorista" con la caja de precios por
+        # unidad). Se ocultan vía JS porque es más robusto que hacer click
+        # (no depende de timing ni de que el botón sea clickeable). Si no se
+        # ocultan, la foto engaña mostrando el precio mayorista por unidad.
+        try:
+            await page.evaluate(_DISMISS_OVERLAYS_JS)
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
+
         # Dejar que la galería/JS terminen de asentar el layout.
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
@@ -378,6 +413,14 @@ class ScreenshotCapturer:
         except Exception:
             pass
         await page.wait_for_timeout(700)
+
+        # Segundo pase de cierre: algunos coachmarks aparecen con retraso
+        # (tras networkidle / render de la buy box).
+        try:
+            await page.evaluate(_DISMISS_OVERLAYS_JS)
+            await page.wait_for_timeout(150)
+        except Exception:
+            pass
 
         return await self._screenshot_detail_section(page, marketplace)
 
