@@ -203,6 +203,12 @@ class Settings(BaseSettings):
     # frontier está lleno. 5s ≈ 720 ciclos/h máx; 10s ≈ 360 ciclos/h.
     ml_loop_sleep_seconds: float = 5.0
 
+    # Throttle incondicional del loop de Amazon (anti-runaway). Mismo motivo
+    # que el de ML: sin esto el loop gira sin pausa cuando el frontier tiene
+    # URLs y no hay captcha, inflando runtime_events (mcp_tool_called) a
+    # millones de filas. 5s ≈ 720 ciclos/h.
+    amazon_loop_sleep_seconds: float = 5.0
+
     # Mantenimiento nocturno (purga runtime_events + VACUUM en hibernación).
     # Ver `src/ofertas_hunter/maintenance/nightly.py`. La ventana cae dentro
     # de la hibernación del scheduler (no se publica nada).

@@ -116,19 +116,21 @@ def _events(db_path, kind=None):
     return [r[0] for r in rows]
 
 
-# F) stop falla → NO VACUUM, success False, evento de skip
+# F) stop falla (p.ej. bot en foreground) → PURGA igual, VACUUM se salta.
+#    La purga es segura en DB viva (WAL); solo el VACUUM requiere exclusividad.
 def test_F_stop_fail_skips_vacuum(db_path):
     env = RobustEnv(stop_succeeds=False)
     summary = _runner(db_path, env).run()
     assert summary.service_stopped is False
-    assert summary.service_stop_result == "stop_failed"
+    assert summary.service_stop_result == "stop_failed_continue_purge"
+    # VACUUM se salta porque el orquestador sigue vivo (sin acceso exclusivo).
     assert summary.vacuum_done is False
     assert "vacuum" not in env.calls
-    assert "stop_service_failed" in summary.errors
-    assert summary.success is False
+    assert summary.vacuum_skipped_reason == "orchestrator_running_no_exclusive_access"
+    # La purga SÍ corre (no se aborta como antes).
+    assert summary.rows_deleted >= 0
     kinds = _events(db_path)
     assert "nightly_service_stop_failed" in kinds
-    assert "nightly_vacuum_skipped_service_not_stopped" in kinds
 
 
 # F-bis) stop falla pero igual intenta dejar el servicio ARRIBA

@@ -306,7 +306,7 @@ def test_no_systemd_orchestrator_running_skips_vacuum(db_path):
     assert summary.service_stopped is False
     assert summary.restart_done is False
     assert summary.vacuum_done is False
-    assert summary.vacuum_skipped_reason == "no_systemd_orchestrator_running"
+    assert summary.vacuum_skipped_reason == "orchestrator_running_no_exclusive_access"
     assert "vacuum" not in env.calls
     assert summary.success is True
 

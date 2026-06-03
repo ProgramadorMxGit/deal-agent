@@ -418,27 +418,21 @@ class NightlyMaintenanceRunner:
                 stopped = not self.env.orchestrator_running()
             summary.service_stopped = bool(stopped)
             if not summary.service_stopped:
-                # Stop falló o timeout: NO correr VACUUM (evita corromper con
-                # el bot aún escribiendo) y dejar el servicio recuperable.
-                summary.service_stop_result = "stop_failed"
-                summary.errors.append("stop_service_failed")
+                # Stop falló (típico cuando el bot corre en FOREGROUND/tmux y
+                # NO como el servicio systemd: `systemctl stop` no afecta al
+                # proceso). NO abortamos: la purga (batches, no exclusiva) es
+                # segura contra la DB viva en modo WAL. Solo se saltará el
+                # VACUUM (lo gatea `_maybe_vacuum` por orquestador vivo).
+                summary.service_stop_result = "stop_failed_continue_purge"
                 self._emit_event("nightly_service_stop_failed", {
                     "service_state": self._service_state(),
-                }, severity="error")
-                self._emit_event("nightly_vacuum_skipped_service_not_stopped", {
-                    "reason": "service_stop_failed",
-                })
-                # Intentar dejar el servicio ARRIBA igualmente (no caído).
+                    "note": "continuamos con purga; VACUUM se salta",
+                }, severity="warning")
+                # Dejar el servicio recuperable si aplica.
                 self._ensure_service_up(summary)
-                summary.success = False
-                summary.service_final_state = self._service_state()
-                self._emit_event("nightly_service_final_state", {
-                    "service_final_state": summary.service_final_state,
-                })
-                self._finish(summary, t0, None, emit=True)
-                return summary
-            summary.service_stop_result = "stopped"
-            self._emit_event("nightly_service_stop_done", {})
+            else:
+                summary.service_stop_result = "stopped"
+                self._emit_event("nightly_service_stop_done", {})
         else:
             summary.service_stop_result = "skipped"
 
@@ -584,17 +578,16 @@ class NightlyMaintenanceRunner:
         if not self.config.vacuum_enabled:
             summary.vacuum_skipped_reason = "disabled"
             return
-        # Sin servicio systemd que detener y con el orquestador aún vivo, un
-        # VACUUM competiría por el lock exclusivo de SQLite con el bot
-        # escribiendo. La purga (batches, no exclusiva) sí es segura, pero el
-        # VACUUM se salta hasta que el operador detenga el bot.
-        if (
-            not summary.service_stopped
-            and not self.env.has_systemd_service()
-            and self.env.orchestrator_running()
-        ):
-            summary.vacuum_skipped_reason = "no_systemd_orchestrator_running"
-            logger.warning("nightly_vacuum_skipped: sin systemd y orquestador vivo")
+        # VACUUM requiere acceso exclusivo a SQLite. Si NO logramos detener al
+        # bot (service_stopped False) y el orquestador sigue vivo, un VACUUM
+        # competiría por el lock y podría corromper/bloquear. La purga (batches,
+        # no exclusiva) sí es segura; el VACUUM se salta. Esto cubre tanto el
+        # caso "sin systemd + foreground" como "stop del servicio falló".
+        if not summary.service_stopped and self.env.orchestrator_running():
+            summary.vacuum_skipped_reason = "orchestrator_running_no_exclusive_access"
+            logger.warning(
+                "nightly_vacuum_skipped: orquestador vivo (sin acceso exclusivo)"
+            )
             return
         if self.env.disk_free_gb() < self.config.vacuum_min_free_gb:
             summary.vacuum_skipped_reason = "low_disk"

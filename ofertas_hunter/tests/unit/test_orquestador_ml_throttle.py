@@ -96,3 +96,38 @@ def test_amazon_and_telegram_loops_untouched_by_ml_const():
     for node in ast.walk(loop_amazon):
         if isinstance(node, ast.Name) and node.id == "ML_LOOP_SLEEP_SECONDS":
             pytest.fail("loop_amazon no debe usar ML_LOOP_SLEEP_SECONDS")
+
+
+def test_amazon_loop_sleep_default(monkeypatch):
+    monkeypatch.delenv("AMAZON_LOOP_SLEEP_SECONDS", raising=False)
+    mod = _load_module(monkeypatch)
+    assert mod.AMAZON_LOOP_SLEEP_SECONDS == 5.0
+
+
+def test_amazon_loop_sleep_from_env(monkeypatch):
+    mod = _load_module(monkeypatch, env={"AMAZON_LOOP_SLEEP_SECONDS": "8"})
+    assert mod.AMAZON_LOOP_SLEEP_SECONDS == 8.0
+
+
+def test_loop_amazon_has_unconditional_throttle_sleep():
+    """loop_amazon debe dormir AMAZON_LOOP_SLEEP_SECONDS (anti-runaway).
+
+    Sin este throttle el loop gira sin pausa cuando el frontier tiene URLs y
+    no hay captcha, inflando runtime_events (mcp_tool_called) a millones.
+    """
+    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+    loop_amazon = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.AsyncFunctionDef) and n.name == "loop_amazon"),
+        None,
+    )
+    assert loop_amazon is not None, "loop_amazon no encontrado"
+    found = False
+    for node in ast.walk(loop_amazon):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "sleep" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Name) and arg.id == "AMAZON_LOOP_SLEEP_SECONDS":
+                    found = True
+                    break
+    assert found, "loop_amazon no tiene sleep(AMAZON_LOOP_SLEEP_SECONDS)"

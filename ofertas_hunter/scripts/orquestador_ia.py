@@ -110,6 +110,12 @@ def _env_float(name: str, default: float) -> float:
 # es ~720 ciclos/h; con 10s, ~360 ciclos/h. Configurable vía .env.
 ML_LOOP_SLEEP_SECONDS = _env_float("ML_LOOP_SLEEP_SECONDS", 5.0)
 
+# Throttle incondicional del loop de Amazon. Mismo problema que ML: cuando el
+# frontier Amazon está lleno y no hay captcha, el loop giraba sin pausa
+# (~decenas de ciclos/s), quemando CPU e inflando runtime_events con
+# `mcp_tool_called` (millones de filas → DB de varios GB). 5s ≈ 720 ciclos/h.
+AMAZON_LOOP_SLEEP_SECONDS = _env_float("AMAZON_LOOP_SLEEP_SECONDS", 5.0)
+
 # --- Shutdown limpio (SIGTERM/SIGINT) ---------------------------------------
 # El mantenimiento nocturno y systemd detienen el bot con una señal. Si los
 # loops no paran ni los browsers Playwright/Chromium cierran limpio antes de
@@ -387,6 +393,12 @@ async def loop_amazon(server, once: bool) -> None:
 
         if once:
             break
+
+        # Throttle incondicional anti-runaway (espejo del de ML). Sin esto el
+        # loop gira sin pausa cuando el frontier tiene URLs y no hay captcha,
+        # inflando runtime_events con millones de `mcp_tool_called`.
+        if AMAZON_LOOP_SLEEP_SECONDS > 0:
+            await asyncio.sleep(AMAZON_LOOP_SLEEP_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +687,14 @@ async def main_async(once: bool) -> None:
         cfg_sleep = float(getattr(s, "ml_loop_sleep_seconds", ML_LOOP_SLEEP_SECONDS))
         if cfg_sleep >= 0:
             ML_LOOP_SLEEP_SECONDS = cfg_sleep
+    except (TypeError, ValueError):
+        pass
+
+    global AMAZON_LOOP_SLEEP_SECONDS
+    try:
+        cfg_sleep_az = float(getattr(s, "amazon_loop_sleep_seconds", AMAZON_LOOP_SLEEP_SECONDS))
+        if cfg_sleep_az >= 0:
+            AMAZON_LOOP_SLEEP_SECONDS = cfg_sleep_az
     except (TypeError, ValueError):
         pass
 
