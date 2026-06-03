@@ -46,6 +46,15 @@ _ML_CATEGORY_PATTERNS = (
 _ML_DEALS_PATTERNS = (
     re.compile(r"mercadolibre\.com\.mx/ofertas"),
     re.compile(r"mercadolibre\.com\.mx/c/.+ofertas"),
+    re.compile(r"mercadolibre\.com\.mx/mas-vendidos"),
+)
+
+# Señales de que un LISTADO (listado.mercadolibre.com.mx/...) es de ofertas:
+# trae filtro de descuento o está en una sección de promociones. Estos listados
+# sí valen score alto porque sus tarjetas vienen con descuento.
+_ML_LISTING_DEAL_SIGNALS = re.compile(
+    r"_Descuento_|_Deal|tier=deal|promociones|/ofertas",
+    re.IGNORECASE,
 )
 
 
@@ -111,10 +120,19 @@ def _classify_mercadolibre(url: str, parsed) -> ClassifiedUrl:
             return ClassifiedUrl(url=url, marketplace="mercadolibre", kind="product", score=10.0)
     for p in _ML_DEALS_PATTERNS:
         if p.search(url):
-            return ClassifiedUrl(url=url, marketplace="mercadolibre", kind="deals", score=6.0)
+            return ClassifiedUrl(url=url, marketplace="mercadolibre", kind="deals", score=8.0)
     for p in _ML_LISTING_PATTERNS:
         if p.search(url):
-            return ClassifiedUrl(url=url, marketplace="mercadolibre", kind="listing", score=3.0)
+            # Distinguir listados de OFERTA (con filtro de descuento/promoción)
+            # de listados de categoría genérica. Los genéricos traen productos
+            # a precio normal y NO deben desplazar a las ofertas en el frontier.
+            if _ML_LISTING_DEAL_SIGNALS.search(url):
+                return ClassifiedUrl(
+                    url=url, marketplace="mercadolibre", kind="deals", score=7.0
+                )
+            return ClassifiedUrl(
+                url=url, marketplace="mercadolibre", kind="listing", score=1.0
+            )
     for p in _ML_CATEGORY_PATTERNS:
         if p.search(url):
             return ClassifiedUrl(url=url, marketplace="mercadolibre", kind="category", score=2.0)

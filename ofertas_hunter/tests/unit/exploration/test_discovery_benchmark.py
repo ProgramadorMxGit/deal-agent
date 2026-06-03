@@ -53,7 +53,10 @@ def test_F_frontier_penalty_lowers_saturated():
 def test_G_new_seeds_classify():
     cases = [
         ("https://www.mercadolibre.com.mx/ofertas/cocina", "mercadolibre", "deals"),
-        ("https://listado.mercadolibre.com.mx/cesto-ropa-sucia_Descuento_50-100", "mercadolibre", "listing"),
+        # Listado con filtro de descuento → ahora se clasifica como 'deals'
+        # (es una página de ofertas, no un listado genérico). Esto lo prioriza
+        # en el frontier sobre los listados de categoría sin descuento.
+        ("https://listado.mercadolibre.com.mx/cesto-ropa-sucia_Descuento_50-100", "mercadolibre", "deals"),
         ("https://www.amazon.com.mx/deals?bubble-id=deals-collection-home-kitchen", "amazon", "deals"),
         ("https://www.amazon.com.mx/s?k=fuente+de+poder+pc&rh=p_n_pct-off-with-tax%3A50-", "amazon", "listing"),
     ]

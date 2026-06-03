@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..browser.browser_context import BrowserWorker, RenderedPage
+from ..exploration.category_offer_seeds import ml_offers_urls_for_categories
 from ..exploration.frontier import FrontierItem, FrontierRepo
 from ..exploration.listing_extractor import (
     extract_amazon_deals,
@@ -112,12 +113,59 @@ class DiscoveryAgent:
                 n += 1
         return n
 
+    def seed_deficit_offer_pages(self) -> int:
+        """Siembra páginas de OFERTAS por categoría deficitaria (mantiene la
+        diversidad sobre ofertas reales, no sobre listados genéricos).
+
+        Sólo aplica a Mercado Libre. Lee el último `pool_deficit_plan` y, por
+        cada categoría deficitaria/recomendada, añade su URL de `/ofertas/<slug>`
+        al frontier (clasificada como `deals`, score alto). Best-effort.
+        """
+        if self.marketplace != "mercadolibre":
+            return 0
+        try:
+            from ..dispatching.category_deficit_planner import get_latest_plan
+
+            plan = get_latest_plan(self.db, max_age_seconds=1800)
+        except Exception:
+            plan = None
+        if not plan:
+            return 0
+        categories = (
+            list(plan.get("recommended_frontier_categories") or [])
+            or list(plan.get("deficit_categories") or [])
+        )
+        if not categories:
+            return 0
+        seeded = 0
+        for url in ml_offers_urls_for_categories(categories):
+            info = classify(url)
+            if info.marketplace != self.marketplace or info.kind == "unknown":
+                continue
+            if self.frontier.add_classified(info):
+                seeded += 1
+        if seeded:
+            self._emit_runtime_event(
+                "discovery_deficit_offers_seeded",
+                "info",
+                {"marketplace": self.marketplace, "seeded": seeded,
+                 "categories": categories},
+            )
+        return seeded
+
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------
 
     async def discover_once(self) -> list[DiscoveryOutcome]:
         outcomes: list[DiscoveryOutcome] = []
+
+        # Mantener diversidad SOBRE ofertas reales: sembrar páginas de ofertas
+        # por categoría deficitaria (ML). Best-effort, idempotente.
+        try:
+            self.seed_deficit_offer_pages()
+        except Exception:
+            logger.debug("seed_deficit_offer_pages falló (no bloqueante)")
 
         # Tomamos URLs de listing/category/deals del frontier.
         items = self.frontier.peek(self.marketplace, kind=None, limit=self.max_per_cycle * 4)

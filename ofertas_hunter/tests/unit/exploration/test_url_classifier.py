@@ -49,3 +49,29 @@ def test_ml_product_score_higher_than_listing():
     a = classify("https://articulo.mercadolibre.com.mx/MLM12345678")
     b = classify("https://listado.mercadolibre.com.mx/laptop")
     assert a.score > b.score
+
+
+def test_ml_generic_listing_low_score():
+    """Un listado de categoría genérica debe tener score bajo (1.0) para no
+    desplazar a las páginas de ofertas en el frontier."""
+    info = classify("https://listado.mercadolibre.com.mx/computacion/laptops")
+    assert info.kind == "listing"
+    assert info.score == 1.0
+
+
+def test_ml_discount_listing_scores_high_as_deals():
+    """Un listado con filtro de descuento es de ofertas → score alto."""
+    info = classify("https://listado.mercadolibre.com.mx/freidora-de-aire_Descuento_50-100")
+    assert info.kind == "deals"
+    assert info.score >= 7.0
+
+
+def test_ml_mas_vendidos_is_deals():
+    info = classify("https://www.mercadolibre.com.mx/mas-vendidos/MLM1000")
+    assert info.kind == "deals"
+
+
+def test_ml_deal_listing_beats_generic_listing():
+    deal = classify("https://listado.mercadolibre.com.mx/laptop_Descuento_50-100")
+    generic = classify("https://listado.mercadolibre.com.mx/laptop")
+    assert deal.score > generic.score
