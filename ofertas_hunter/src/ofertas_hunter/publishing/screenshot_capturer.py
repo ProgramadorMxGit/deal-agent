@@ -173,6 +173,12 @@ class ScreenshotCapturer:
         self._context = None
         self._page = None
         self._lock = asyncio.Lock()
+        # mtime de cada archivo de cookies en la última inyección. Permite
+        # detectar rotaciones en disco (ML rota su sesión constantemente) y
+        # re-inyectar cookies frescas en el contexto del capturer. Sin esto,
+        # el capturer se quedaba con las cookies del arranque y, tras la
+        # primera rotación de ML, capturaba PDPs deslogueados → fallback.
+        self._cookie_mtimes_seen: dict[str, float] = {}
         # Si Playwright no está disponible, desactivamos para no reintentar.
         self._unavailable = False
         # Contador de fallos de arranque consecutivos. Sólo tras varios
@@ -264,6 +270,65 @@ class ScreenshotCapturer:
                 self._unavailable = True
             return False
 
+    def _cookie_file_paths(self) -> list[str]:
+        """Rutas de archivos de cookies que el capturer vigila para rotación.
+
+        Resuelve las mismas rutas que usan los loaders (`MercadoLibreSession`
+        / `AmazonSession`), respetando fallbacks. Best-effort: si algo falla
+        devuelve lo que tenga.
+        """
+        paths: list[str] = []
+        try:
+            from ..session.cookie_store import resolve_cookie_path
+
+            ml = resolve_cookie_path(
+                primary=self.mercadolibre_cookies_path,
+                default=self.mercadolibre_cookies_fallback_path
+                or "secrets/mercadolibre_cookies.json",
+            )
+            paths.append(str(ml))
+        except Exception:
+            if self.mercadolibre_cookies_path:
+                paths.append(self.mercadolibre_cookies_path)
+        if self.amazon_cookies_path:
+            paths.append(self.amazon_cookies_path)
+        return paths
+
+    def _current_cookie_mtimes(self) -> dict[str, float]:
+        """mtime actual de cada archivo de cookies (los inexistentes se omiten)."""
+        import os
+
+        out: dict[str, float] = {}
+        for p in self._cookie_file_paths():
+            try:
+                out[p] = os.path.getmtime(p)
+            except OSError:
+                continue
+        return out
+
+    async def _maybe_refresh_cookies(self) -> bool:
+        """Re-inyecta cookies si algún archivo cambió en disco desde la última
+        inyección. Devuelve True si re-inyectó.
+
+        ML rota su sesión muy seguido (el session manager reescribe el archivo
+        y hace hot-reload en el browser del hunter). El capturer es un browser
+        aparte: si no refresca, se queda con cookies viejas y captura PDPs
+        deslogueados. Comparamos mtimes y, si difieren, limpiamos cookies del
+        contexto y volvemos a inyectar las frescas.
+        """
+        if self._context is None:
+            return False
+        current = self._current_cookie_mtimes()
+        if current == self._cookie_mtimes_seen:
+            return False
+        # Limpiar cookies viejas antes de re-inyectar (rotación in-place).
+        try:
+            await self._context.clear_cookies()
+        except Exception:
+            pass
+        await self._inject_cookies()
+        return True
+
     async def _inject_cookies(self) -> None:
         """Carga cookies de ML y Amazon en el contexto (best-effort)."""
         if self._context is None:
@@ -293,6 +358,8 @@ class ScreenshotCapturer:
                 logger.info("ScreenshotCapturer: %d cookies Amazon cargadas", len(cookies))
         except Exception as exc:
             logger.warning("ScreenshotCapturer: cookies Amazon no cargadas (%s)", exc)
+        # Recordar mtimes para detectar rotaciones futuras.
+        self._cookie_mtimes_seen = self._current_cookie_mtimes()
 
     async def _teardown(self) -> None:
         """Cierra browser/context/playwright actuales (sin desactivar la
@@ -339,6 +406,14 @@ class ScreenshotCapturer:
         async with self._lock:
             if not await self._ensure_started():
                 return None
+            # Refrescar cookies si rotaron en disco (ML rota su sesión muy
+            # seguido). Sin esto el capturer se queda con cookies viejas y
+            # captura PDPs deslogueados → fallback permanente sólo en ML.
+            try:
+                if await self._maybe_refresh_cookies():
+                    logger.info("ScreenshotCapturer: cookies refrescadas (rotación detectada)")
+            except Exception:
+                pass
             page = None
             try:
                 # Página FRESCA por captura: evita que una sola página de vida
