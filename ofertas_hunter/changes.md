@@ -4,6 +4,16 @@ Log de decisiones por bloque, alineado con la spec del usuario.
 
 ---
 
+## 2026-06-05
+
+* Archivo: `src/ofertas_hunter/publishing/screenshot_capturer.py`, `tests/unit/publishing/test_screenshot_capturer_cookie_refresh.py` (nuevo). Commit `f24bf67`.
+* Cambio: el `ScreenshotCapturer` ahora detecta rotación de los archivos de cookies (por `mtime`) y re-inyecta cookies frescas en su contexto antes de cada captura (`_maybe_refresh_cookies`, `_cookie_file_paths`, `_current_cookie_mtimes`; `_inject_cookies` registra mtimes al final).
+* Motivo: causa raíz de la regresión "ML manda foto pública en vez de screenshot". El capturer inyectaba cookies UNA sola vez al arrancar y nunca las refrescaba. ML rota su sesión constantemente (el session manager reescribe el archivo y hace hot-reload en el browser del hunter, ~cada 16s), pero el capturer es un browser singleton aparte que nadie refrescaba. Tras la primera rotación ML post-arranque (4 jun 23:46), las cookies del capturer quedaban viejas → el PDP de catálogo `/p/MLM...` renderizaba deslogueado (sin `h1.ui-pdp-title`) → captura `None` → 100% fallback a imagen pública SOLO en ML. Amazon (cookies estáticas inyectadas a mano) seguía al 100% de screenshots, lo que confundía el diagnóstico ("a veces sí, a veces no" era en realidad "Amazon sí, ML no").
+* Diagnóstico (systematic-debugging): experimento controlado en VPS — con headers reales del capturer, cookies frescas = 3/3 PDP ML renderizaron; sin cookies = 0/3. DB confirmó ML 0 screenshots / 50 fallback el 5 jun vs Amazon 69/0. Último screenshot ML OK: 4 jun 23:46.
+* Resultado: ✅ 77 tests de publishing verdes (incl. 3 nuevos). Verificado E2E en VPS: capturer con cookies stale detecta rotación → refresca → captura ML OK (109KB). Tras reiniciar el bot, primera publicación ML post-fix usó screenshot (ss=1 fb=0), Amazon intacto (ss=2 fb=0).
+
+---
+
 ## 2026-06-01
 
 * Archivo: `src/ofertas_hunter/publishing/screenshot_capturer.py` (nuevo), `src/ofertas_hunter/publishing/whatsapp_publisher.py`, `src/ofertas_hunter/orchestrator.py`, `src/ofertas_hunter/config.py`, `tests/unit/publishing/test_publisher_screenshot.py` (nuevo), `tests/unit/publishing/test_screenshot_capturer_urls.py` (nuevo), `.env.example`, `.gitignore`
