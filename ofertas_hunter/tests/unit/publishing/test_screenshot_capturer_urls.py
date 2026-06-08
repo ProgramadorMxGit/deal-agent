@@ -25,6 +25,31 @@ def test_normalize_ml_leaves_non_catalog_articulo_untouched():
     assert normalize_ml_pdp_url(url) == url
 
 
+def test_normalize_ml_rewrites_slugless_item_to_catalog():
+    """`articulo.mercadolibre.com.mx/MLM44015633` (item-id sin slug ni /p/)
+    devuelve un shell vacío que NO hidrata → se reescribe a la forma de
+    catálogo `www.mercadolibre.com.mx/p/MLM44015633` que sí renderiza el PDP.
+    """
+    raw = "https://articulo.mercadolibre.com.mx/MLM44015633"
+    fixed = normalize_ml_pdp_url(raw)
+    assert fixed == "https://www.mercadolibre.com.mx/p/MLM44015633"
+
+
+def test_normalize_ml_rewrites_slugless_item_with_hyphen():
+    """Variante con guion `MLM-44015633` → mismo destino de catálogo."""
+    raw = "https://articulo.mercadolibre.com.mx/MLM-44015633"
+    fixed = normalize_ml_pdp_url(raw)
+    assert fixed == "https://www.mercadolibre.com.mx/p/MLM44015633"
+
+
+def test_normalize_ml_leaves_articulo_with_real_slug_untouched():
+    """Un `articulo.` con slug descriptivo real (no es item-id pelado) NO se
+    toca: esas páginas sí renderizan en su host original.
+    """
+    url = "https://articulo.mercadolibre.com.mx/MLM-123-taladro-inalambrico-rojo"
+    assert normalize_ml_pdp_url(url) == url
+
+
 def test_resolve_capture_url_ml_uses_canonical_not_short_link():
     payload = {
         "marketplace": "mercadolibre",

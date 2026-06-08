@@ -27,11 +27,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
 
 logger = logging.getLogger(__name__)
+
+# Path de `articulo.mercadolibre.com.mx` que es SOLO un item-id pelado, sin
+# slug descriptivo: `/MLM44015633` o `/MLM-44015633`. Esas URLs devuelven un
+# shell vacío que no hidrata; hay que reescribirlas a la forma de catálogo
+# `www.mercadolibre.com.mx/p/<itemid>`. Un slug real (`/MLM-123-taladro-...`)
+# NO matchea porque tiene texto adicional tras los dígitos.
+_ML_BARE_ITEM_PATH_RE = re.compile(
+    r"^/(?P<country>ML[A-Z])-?(?P<digits>\d+)/?$"
+)
 
 
 _USER_AGENT = (
@@ -113,8 +123,17 @@ def normalize_ml_pdp_url(url: str) -> str:
     except Exception:
         return url
     host = (parsed.netloc or "").lower()
-    if host == "articulo.mercadolibre.com.mx" and "/p/" in (parsed.path or ""):
-        return urlunparse(parsed._replace(netloc="www.mercadolibre.com.mx"))
+    if host == "articulo.mercadolibre.com.mx":
+        path = parsed.path or ""
+        if "/p/" in path:
+            return urlunparse(parsed._replace(netloc="www.mercadolibre.com.mx"))
+        # Item-id pelado sin slug ni /p/ (`/MLM44015633` o `/MLM-44015633`):
+        # ML devuelve un shell vacío que no hidrata. La forma de catálogo
+        # `www.mercadolibre.com.mx/p/MLM44015633` sí renderiza el PDP.
+        m = _ML_BARE_ITEM_PATH_RE.match(path)
+        if m:
+            item_id = m.group("country") + m.group("digits")
+            return f"https://www.mercadolibre.com.mx/p/{item_id}"
     return url
 
 
