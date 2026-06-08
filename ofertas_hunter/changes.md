@@ -4,6 +4,27 @@ Log de decisiones por bloque, alineado con la spec del usuario.
 
 ---
 
+## 2026-06-08 (b)
+
+* Archivo: `src/ofertas_hunter/publishing/screenshot_capturer.py`, `tests/unit/publishing/test_screenshot_capturer_urls.py`. Commit `a6c2a28`.
+* Cambio: `normalize_ml_pdp_url` ahora reescribe URLs `articulo.mercadolibre.com.mx/MLM<id>` y `/MLM-<id>` (item-id pelado, sin slug ni `/p/`) a `www.mercadolibre.com.mx/p/<itemid>`. Añadido `_ML_BARE_ITEM_PATH_RE`.
+* Motivo: el usuario reportó que la última publicación ML salió con la foto pública en vez del screenshot del PDP. Causa raíz (systematic-debugging): esas URLs slug-less devuelven un **shell HTML vacío de ~9KB** (`#root-app` sin hidratar, sin `h1.ui-pdp-title`) → el capturer no encontraba el título y caía a fallback. NO es captcha/IP (navegación sin challenge) ni cookies (sesión válida). El formato afecta a **~25% de las ofertas ML** (73 de 292 en 48h). El `meli.la`/`affiliate_url` no sirve (redirige al perfil social del afiliado).
+* Validación: probadas 4 formas de URL para el item — solo `www.mercadolibre.com.mx/p/<id>` renderiza (h1=True, gallery=1). Confirmado en 5/5 items slug-less reales (orig=no-h1 → fix=OK). E2E en VPS: captura OK 120KB tras el fix.
+* Resultado: ✅ 80 tests de publishing verdes (4 nuevos de normalización). Desplegado y bot reiniciado (ahora en tmux, PID 3480969).
+
+---
+
+## 2026-06-06
+
+* Diagnóstico (no cambio de código): el usuario reportó que "las últimas dos salieron con screenshots así" (Termo y Taladro mostraban solo la foto del producto, sin el panel título+precio+buybox).
+* Hallazgo: esas dos NO eran screenshots del PDP sino el **fallback a imagen pública** (`media_url=[image_url:0]`) — la foto del catálogo de ML, que es exactamente una imagen de producto sin panel. Es decir, la captura de pantalla volvió a fallar y cayó al fallback.
+* Causa raíz (systematic-debugging): NO es problema de cookies (las cookies de auth `orguseridp`/`ssid`/`ftid`/`_d2id` están vigentes hasta 2027) ni del fix de mtime del 5 jun. Es un **challenge anti-bot de ML por IP de datacenter**: los PDP de catálogo (`/p/MLM...`) redirigen a `/gz/account-verification` desde la IP de la VPS. Confirmado que ocurre **incluso anónimo (sin cookies)** y **con el perfil persistente**, 100% de las veces en la ventana de prueba (19h UTC). Es intermitente a lo largo del día (14h-15h UTC = 11/11 screenshots OK; 16h/18h parcial; 19h total fallback).
+* Evidencia adicional: el **hunter ML sigue sano** — encola ofertas con título/precio válidos (oid 6482-6488 hasta 18:35). El extractor de ofertas no usa la misma ruta de render que el screenshot (el screenshot navega el PDP completo de catálogo, que es justo lo que ML está challengeando).
+* Conclusión: condición externa (reputación de IP del datacenter ante el anti-bot de ML), no un bug. El fallback a imagen pública funciona como red de seguridad (la oferta igual se publica con foto + precios correctos). Sin cambio de código por ahora; el fix del 5 jun (refresco de cookies) sigue siendo correcto para el caso de rotación.
+* Mitigaciones posibles a futuro (si el fallback molesta): warmup de home ML antes de capturar, reintento con backoff cuando detecta `account-verification`, o proxy residencial para las capturas. Pendiente de decisión del usuario.
+
+---
+
 ## 2026-06-05
 
 * Archivo: `src/ofertas_hunter/publishing/screenshot_capturer.py`, `tests/unit/publishing/test_screenshot_capturer_cookie_refresh.py` (nuevo). Commit `f24bf67`.
